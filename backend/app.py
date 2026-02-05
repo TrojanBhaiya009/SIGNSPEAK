@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import cv2
 import numpy as np
 import base64
@@ -12,7 +13,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from sign_model import SignLanguageModel
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Initialize Socket.IO with CORS
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Initialize ML model
 model = SignLanguageModel()
@@ -279,7 +283,195 @@ def train_model():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ==================== Socket.IO Events ====================
+
+@socketio.on('connect')
+def handle_connect():
+    print(f"[SOCKET] Client connected: {request.sid}", flush=True)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"[SOCKET] Client disconnected: {request.sid}", flush=True)
+    # Remove from any meetings they were in
+    for code, meeting in list(meetings.items()):
+        # Remove from participants
+        original_count = len(meeting['participants'])
+        meeting['participants'] = [p for p in meeting['participants'] if p.get('sid') != request.sid]
+        
+        if len(meeting['participants']) < original_count:
+            # Notify others in the room
+            socketio.emit('participant_left', {
+                'meeting_code': code,
+                'participants': meeting['participants']
+            }, room=code)
+        
+        # Remove from pending
+        meeting['pending'] = [p for p in meeting['pending'] if p.get('sid') != request.sid]
+
+@socketio.on('create_meeting')
+def handle_create_meeting(data):
+    """Host creates a new meeting"""
+    meeting_code = data.get('code')
+    host_id = data.get('host_id')
+    host_name = data.get('host_name')
+    
+    print(f"[SOCKET] Creating meeting: {meeting_code} by {host_name}", flush=True)
+    
+    meetings[meeting_code] = {
+        'code': meeting_code,
+        'host_id': host_id,
+        'host_sid': request.sid,
+        'host_name': host_name,
+        'created_at': datetime.now().isoformat(),
+        'participants': [{
+            'id': host_id,
+            'sid': request.sid,
+            'name': host_name,
+            'is_host': True,
+            'joined_at': datetime.now().isoformat()
+        }],
+        'pending': []
+    }
+    
+    # Join the socket room
+    join_room(meeting_code)
+    
+    emit('meeting_created', {
+        'success': True,
+        'meeting': meetings[meeting_code]
+    })
+
+@socketio.on('join_meeting')
+def handle_join_meeting(data):
+    """Participant requests to join meeting"""
+    meeting_code = data.get('code')
+    participant_id = data.get('participant_id')
+    participant_name = data.get('participant_name')
+    
+    print(f"[SOCKET] {participant_name} requesting to join: {meeting_code}", flush=True)
+    
+    if meeting_code not in meetings:
+        emit('join_error', {'error': 'Meeting not found'})
+        return
+    
+    # Add to pending list
+    pending_entry = {
+        'id': participant_id,
+        'sid': request.sid,
+        'name': participant_name,
+        'requested_at': datetime.now().isoformat()
+    }
+    meetings[meeting_code]['pending'].append(pending_entry)
+    
+    # Join the room to receive updates
+    join_room(meeting_code)
+    
+    # Notify the host about new pending participant
+    socketio.emit('pending_participant', {
+        'meeting_code': meeting_code,
+        'participant': pending_entry,
+        'pending': meetings[meeting_code]['pending']
+    }, room=meeting_code)
+    
+    emit('waiting_approval', {'status': 'pending', 'meeting_code': meeting_code})
+
+@socketio.on('admit_participant')
+def handle_admit_participant(data):
+    """Host admits a pending participant"""
+    meeting_code = data.get('code')
+    participant_id = data.get('participant_id')
+    
+    print(f"[SOCKET] Admitting participant: {participant_id} to {meeting_code}", flush=True)
+    
+    if meeting_code not in meetings:
+        return
+    
+    meeting = meetings[meeting_code]
+    
+    # Find pending participant
+    pending = next((p for p in meeting['pending'] if p['id'] == participant_id), None)
+    if not pending:
+        return
+    
+    # Move from pending to participants
+    meeting['pending'].remove(pending)
+    participant_entry = {
+        'id': pending['id'],
+        'sid': pending['sid'],
+        'name': pending['name'],
+        'is_host': False,
+        'joined_at': datetime.now().isoformat()
+    }
+    meeting['participants'].append(participant_entry)
+    
+    # Notify everyone in the room
+    socketio.emit('participant_admitted', {
+        'meeting_code': meeting_code,
+        'participant': participant_entry,
+        'participants': meeting['participants'],
+        'pending': meeting['pending']
+    }, room=meeting_code)
+
+@socketio.on('reject_participant')
+def handle_reject_participant(data):
+    """Host rejects a pending participant"""
+    meeting_code = data.get('code')
+    participant_id = data.get('participant_id')
+    
+    print(f"[SOCKET] Rejecting participant: {participant_id} from {meeting_code}", flush=True)
+    
+    if meeting_code not in meetings:
+        return
+    
+    meeting = meetings[meeting_code]
+    
+    # Find and notify the rejected participant
+    pending = next((p for p in meeting['pending'] if p['id'] == participant_id), None)
+    if pending:
+        socketio.emit('join_rejected', {'meeting_code': meeting_code}, to=pending['sid'])
+        meeting['pending'].remove(pending)
+    
+    # Update room
+    socketio.emit('pending_updated', {
+        'meeting_code': meeting_code,
+        'pending': meeting['pending']
+    }, room=meeting_code)
+
+@socketio.on('leave_meeting')
+def handle_leave_meeting(data):
+    """Participant leaves meeting"""
+    meeting_code = data.get('code')
+    participant_id = data.get('participant_id')
+    
+    print(f"[SOCKET] Participant leaving: {participant_id} from {meeting_code}", flush=True)
+    
+    if meeting_code not in meetings:
+        return
+    
+    meeting = meetings[meeting_code]
+    meeting['participants'] = [p for p in meeting['participants'] if p['id'] != participant_id]
+    meeting['pending'] = [p for p in meeting['pending'] if p['id'] != participant_id]
+    
+    leave_room(meeting_code)
+    
+    # Notify others
+    socketio.emit('participant_left', {
+        'meeting_code': meeting_code,
+        'participant_id': participant_id,
+        'participants': meeting['participants']
+    }, room=meeting_code)
+
+@socketio.on('get_meeting_state')
+def handle_get_meeting_state(data):
+    """Get current meeting state"""
+    meeting_code = data.get('code')
+    
+    if meeting_code in meetings:
+        emit('meeting_state', meetings[meeting_code])
+    else:
+        emit('meeting_state', {'error': 'Meeting not found'})
+
 if __name__ == '__main__':
-    print("Starting Sign Language Backend Server...")
+    print("Starting Sign Language Backend Server with Socket.IO...")
     print("http://localhost:5000")
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=False, host='0.0.0.0', port=5000)

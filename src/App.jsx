@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useUser, useAuth, UserButton, SignIn } from '@clerk/clerk-react'
+import { io } from 'socket.io-client'
 import './App.css'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000'
@@ -11,6 +12,7 @@ function App() {
   const canvasRef = useRef(null)
   const handsRef = useRef(null)
   const cameraRef = useRef(null)
+  const socketRef = useRef(null)  // Socket.io connection
   
   // Auth states
   const [username, setUsername] = useState(user?.username || '')
@@ -35,6 +37,95 @@ function App() {
   const [pendingParticipants, setPendingParticipants] = useState([])
   const [isHost, setIsHost] = useState(false)
   const [toast, setToast] = useState('')  // Toast notification
+  const [waitingApproval, setWaitingApproval] = useState(false)  // Waiting for host to admit
+
+  // Initialize Socket.io connection
+  useEffect(() => {
+    const socket = io(BACKEND_URL, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
+    })
+    
+    socketRef.current = socket
+    
+    socket.on('connect', () => {
+      console.log('Socket connected:', socket.id)
+      setBackendStatus('Connected')
+    })
+    
+    socket.on('disconnect', () => {
+      console.log('Socket disconnected')
+      setBackendStatus('Disconnected')
+    })
+    
+    // Meeting events
+    socket.on('meeting_created', (data) => {
+      console.log('Meeting created:', data)
+      if (data.success) {
+        setParticipants(data.meeting.participants)
+        setPendingParticipants(data.meeting.pending || [])
+      }
+    })
+    
+    socket.on('pending_participant', (data) => {
+      console.log('Pending participant:', data)
+      setPendingParticipants(data.pending || [])
+      setToast(`${data.participant.name} wants to join`)
+      setTimeout(() => setToast(''), 3000)
+    })
+    
+    socket.on('waiting_approval', (data) => {
+      console.log('Waiting for approval:', data)
+      setWaitingApproval(true)
+    })
+    
+    socket.on('participant_admitted', (data) => {
+      console.log('Participant admitted:', data)
+      setParticipants(data.participants || [])
+      setPendingParticipants(data.pending || [])
+      setWaitingApproval(false)
+      // If this is us being admitted, we can now fully join
+      if (data.participant.id === user?.id) {
+        setToast('You have been admitted to the meeting!')
+        setTimeout(() => setToast(''), 3000)
+      }
+    })
+    
+    socket.on('join_rejected', () => {
+      setWaitingApproval(false)
+      setToast('Your request to join was denied')
+      setTimeout(() => setToast(''), 3000)
+      setScreen('home')
+    })
+    
+    socket.on('join_error', (data) => {
+      setToast(data.error || 'Failed to join meeting')
+      setTimeout(() => setToast(''), 3000)
+      setWaitingApproval(false)
+    })
+    
+    socket.on('participant_left', (data) => {
+      console.log('Participant left:', data)
+      setParticipants(data.participants || [])
+    })
+    
+    socket.on('pending_updated', (data) => {
+      setPendingParticipants(data.pending || [])
+    })
+    
+    socket.on('meeting_state', (data) => {
+      if (!data.error) {
+        setParticipants(data.participants || [])
+        setPendingParticipants(data.pending || [])
+      }
+    })
+    
+    return () => {
+      socket.disconnect()
+    }
+  }, [user?.id])
 
   // Initialize app
   useEffect(() => {
@@ -45,18 +136,8 @@ function App() {
       return
     }
     
-    if (user && !participants.find(p => p.id === user.id)) {
-      setParticipants([{
-        id: user.id,
-        name: username || user.username || 'Anonymous',
-        joinedAt: new Date(),
-        isHost: true
-      }])
-      setIsHost(true)
-    }
-    
     checkBackendStatus()
-    const interval = setInterval(checkBackendStatus, 5000)
+    const interval = setInterval(checkBackendStatus, 10000)  // Less frequent since socket handles status
     return () => clearInterval(interval)
   }, [isLoaded, isSignedIn, user, username])
 
@@ -237,7 +318,7 @@ function App() {
     predictionInFlightRef.current = false
   }
 
-  const startCall = async () => {
+  const startCall = async (asHost = true) => {
     try {
       const constraints = {
         video: { width: { ideal: 1280 }, height: { ideal: 720 } }
@@ -249,11 +330,23 @@ function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream
         setIsActive(true)
+        
+        // If starting as host, create meeting via socket
+        if (asHost && socketRef.current) {
+          setIsHost(true)
+          socketRef.current.emit('create_meeting', {
+            code: meetingCode,
+            host_id: user.id,
+            host_name: username || user.username || 'Anonymous'
+          })
+        }
+        
         setTimeout(() => setScreen('call'), 100)
       }
     } catch (error) {
       console.error('Camera error:', error)
-      alert('Cannot access camera:\n' + error.message)
+      setToast('Cannot access camera: ' + error.message)
+      setTimeout(() => setToast(''), 3000)
     }
   }
 
@@ -261,8 +354,21 @@ function App() {
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach(track => track.stop())
     }
+    
+    // Leave meeting via socket
+    if (socketRef.current && meetingCode) {
+      socketRef.current.emit('leave_meeting', {
+        code: meetingCode,
+        participant_id: user.id
+      })
+    }
+    
     setIsActive(false)
     setScreen('home')
+    setIsHost(false)
+    setParticipants([])
+    setPendingParticipants([])
+    setWaitingApproval(false)
   }
 
   // Caption control functions
@@ -437,31 +543,45 @@ function App() {
     setTimeout(() => setToast(''), 2000)
   }
 
-  const handleJoinMeeting = () => {
+  const handleJoinMeeting = async () => {
     if (!joinCode.trim()) {
       setToast('Please enter a meeting code')
       setTimeout(() => setToast(''), 2000)
       return
     }
+    
     setMeetingCode(joinCode)
-    setPendingParticipants([{
-      id: user.id,
-      name: username || user.username || 'Anonymous',
-      joinedAt: new Date()
-    }])
-    startCall()
+    setIsHost(false)
+    
+    // Request to join via socket
+    if (socketRef.current) {
+      socketRef.current.emit('join_meeting', {
+        code: joinCode,
+        participant_id: user.id,
+        participant_name: username || user.username || 'Anonymous'
+      })
+    }
+    
+    // Start camera but user will wait for approval
+    await startCall(false)  // Not as host
   }
 
   const admitParticipant = (participantId) => {
-    const pending = pendingParticipants.find(p => p.id === participantId)
-    if (pending) {
-      setParticipants([...participants, pending])
-      setPendingParticipants(pendingParticipants.filter(p => p.id !== participantId))
+    if (socketRef.current) {
+      socketRef.current.emit('admit_participant', {
+        code: meetingCode,
+        participant_id: participantId
+      })
     }
   }
 
   const rejectParticipant = (participantId) => {
-    setPendingParticipants(pendingParticipants.filter(p => p.id !== participantId))
+    if (socketRef.current) {
+      socketRef.current.emit('reject_participant', {
+        code: meetingCode,
+        participant_id: participantId
+      })
+    }
   }
 
   const clearTranscript = () => setTranscript('')
@@ -917,6 +1037,18 @@ function App() {
       {/* CALL VIEW */}
       {screen === 'call' && (
         <div className="call-view">
+          {/* Waiting for approval overlay */}
+          {waitingApproval && !isHost && (
+            <div className="waiting-approval-overlay">
+              <div className="waiting-approval-card">
+                <div className="waiting-spinner"></div>
+                <h2>Waiting for Host</h2>
+                <p>The host will let you in soon...</p>
+                <button className="btn btn-secondary" onClick={endCall}>Cancel</button>
+              </div>
+            </div>
+          )}
+          
           {/* Header */}
           <div className="call-header">
             <div className="call-info">

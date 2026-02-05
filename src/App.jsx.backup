@@ -1,0 +1,418 @@
+import { useState, useRef, useEffect } from 'react'
+import './App.css'
+
+function App() {
+  const videoRef = useRef(null)
+  const canvasRef = useRef(null)
+  const [screen, setScreen] = useState('start') // start, create, join, call
+  const [isActive, setIsActive] = useState(false)
+  const [detected, setDetected] = useState('Waiting for hands...')
+  const [confidence, setConfidence] = useState(0)
+  const [transcript, setTranscript] = useState('')
+  const [backendStatus, setBackendStatus] = useState('Disconnected')
+  const [meetingCode, setMeetingCode] = useState('SL-' + Math.random().toString(36).substr(2, 9).toUpperCase())
+  const [joinCode, setJoinCode] = useState('')
+  const [participants, setParticipants] = useState(['You'])
+  const [isMuted, setIsMuted] = useState(false)
+  const frameCountRef = useRef(0)
+
+  // Check backend status
+  useEffect(() => {
+    checkBackendStatus()
+    const interval = setInterval(checkBackendStatus, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Start recording loop when call screen is active
+  useEffect(() => {
+    console.log('=== useEffect FIRED: screen=' + screen + ', isActive=' + isActive)
+    if (screen === 'call' && isActive) {
+      console.log('✓ CONDITIONS MET - Starting recordingLoop!')
+      recordingLoop()
+    }
+  }, [screen, isActive])
+
+  const checkBackendStatus = async () => {
+    try {
+      const response = await fetch('http://localhost:5000/health')
+      if (response.ok) {
+        setBackendStatus('Connected')
+      }
+    } catch (error) {
+      setBackendStatus('Disconnected')
+    }
+  }
+
+  const startCall = async () => {
+    console.log('=== startCall() STARTED ===')
+    console.log('videoRef.current exists?', !!videoRef.current)
+    try {
+      const constraints = {
+        video: { 
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      }
+      if (!isMuted) {
+        constraints.audio = true
+      }
+
+      console.log('Requesting camera...')
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      console.log('✓ Stream obtained:', stream)
+      console.log('Stream active?', stream.active)
+      
+      console.log('Setting stream to videoRef...')
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        console.log('✓ Stream set to videoRef')
+        setIsActive(true)
+        console.log('✓ isActive set to true - waiting 100ms...')
+        // Use a small delay to ensure React state updates before changing screen
+        setTimeout(() => {
+          console.log('✓✓ NOW setting screen to CALL')
+          setScreen('call')
+          console.log('✓✓ setScreen("call") called')
+        }, 100)
+      } else {
+        console.error('✗ videoRef.current is NULL!')
+      }
+    } catch (error) {
+      console.error('Camera error:', error)
+      alert('Cannot access camera:\n' + error.message + '\n\nPlease check:\n1. Camera permissions\n2. Camera is not in use by another app')
+    }
+  }
+
+  const endCall = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      videoRef.current.srcObject.getTracks().forEach(track => track.stop())
+      setIsActive(false)
+      setScreen('start')
+    }
+  }
+
+  const recordingLoop = () => {
+    if (!isActive || !videoRef.current || !canvasRef.current) {
+      return
+    }
+
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d')
+    
+    if (videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
+
+      canvas.toBlob(async (blob) => {
+        if (!blob) {
+          requestAnimationFrame(recordingLoop)
+          return
+        }
+        
+        const base64 = await new Promise((resolve) => {
+          const reader = new FileReader()
+          reader.onloadend = () => resolve(reader.result.split(',')[1])
+          reader.readAsDataURL(blob)
+        })
+
+        try {
+          const response = await fetch('http://localhost:5000/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: base64 })
+          })
+          
+          const data = await response.json()
+          setDetected(data.sign || 'Waiting for hands...')
+          setConfidence(Math.round((data.confidence || 0) * 100))
+          
+          if (data.sign && data.confidence > 0.4) {
+            setTranscript(prev => prev + ' ' + data.sign)
+          }
+        } catch (error) {
+          console.error('Prediction error:', error)
+        }
+
+        frameCountRef.current++
+        requestAnimationFrame(recordingLoop)
+      })
+    } else {
+      requestAnimationFrame(recordingLoop)
+    }
+  }
+
+  const copyMeetingCode = () => {
+    navigator.clipboard.writeText(meetingCode)
+    alert('Meeting code copied to clipboard!')
+  }
+
+  const handleJoinMeeting = () => {
+    if (!joinCode.trim()) {
+      alert('Please enter a meeting code')
+      return
+    }
+    setMeetingCode(joinCode)
+    startCall()
+  }
+
+  const clearTranscript = () => {
+    setTranscript('')
+  }
+
+  const downloadTranscript = () => {
+    const element = document.createElement('a')
+    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(transcript))
+    element.setAttribute('download', 'transcript.txt')
+    element.style.display = 'none'
+    document.body.appendChild(element)
+    element.click()
+    document.body.removeChild(element)
+  }
+
+  return (
+    <div className="app">
+      {/* Video element - ALWAYS in DOM, visibility controlled by screen state */}
+      <video 
+        ref={videoRef}
+        autoPlay 
+        playsInline
+        muted
+        style={{ 
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: screen === 'call' ? '100%' : '1px',
+          height: screen === 'call' ? '100%' : '1px',
+          objectFit: 'cover',
+          transform: 'scaleX(-1)',
+          zIndex: screen === 'call' ? 1 : -1,
+          pointerEvents: 'none'
+        }}
+      />
+      
+      {/* Canvas ref - hidden for frame capture */}
+      <canvas 
+        ref={canvasRef}
+        width="1280"
+        height="720"
+        style={{ display: 'none' }}
+      />
+      
+      {/* Video element - rendered conditionally in the DOM when on call screen */}
+
+      {screen === 'start' ? (
+        // Start screen - choose create or join
+        <div className="preCall">
+          <div className="preCallContent">
+            <div className="logo">🤟</div>
+            <h1>Sign Language Connection</h1>
+            <p>Real-time hand gesture recognition & video conferencing</p>
+            
+            <div className="optionsGrid">
+              <div className="optionCard" onClick={() => setScreen('create')}>
+                <div className="optionIcon">🆕</div>
+                <h3>Create Meeting</h3>
+                <p>Start a new meeting with a unique code</p>
+              </div>
+              <div className="optionCard" onClick={() => setScreen('join')}>
+                <div className="optionIcon">🔗</div>
+                <h3>Join Meeting</h3>
+                <p>Enter a meeting code to join</p>
+              </div>
+            </div>
+
+            <div className="statusBadge">
+              Backend: <span className={backendStatus === 'Connected' ? 'status-ok' : 'status-error'}>
+                {backendStatus}
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : screen === 'create' ? (
+        // Create meeting screen
+        <div className="preCall">
+          <div className="preCallContent">
+            <div className="logo">🤟</div>
+            <h1>Create Meeting</h1>
+            <p>Share this code with others to join</p>
+            
+            <div className="preCallCard">
+              <div className="meetingSection">
+                <h3>Your Meeting Code</h3>
+                <div className="meetingCode">
+                  <input type="text" value={meetingCode} readOnly />
+                  <button onClick={copyMeetingCode} className="copyBtn">Copy Code</button>
+                </div>
+              </div>
+
+              <button className="joinBtn" onClick={startCall}>
+                <span className="icon">📞</span>
+                Start Meeting
+              </button>
+
+              <div className="preCallFooter">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    checked={isMuted}
+                    onChange={(e) => setIsMuted(e.target.checked)}
+                  />
+                  Start with microphone off
+                </label>
+              </div>
+
+              <button className="backBtn" onClick={() => setScreen('start')}>
+                ← Back
+              </button>
+            </div>
+
+            <div className="statusBadge">
+              Backend: <span className={backendStatus === 'Connected' ? 'status-ok' : 'status-error'}>
+                {backendStatus}
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : screen === 'join' ? (
+        // Join meeting screen
+        <div className="preCall">
+          <div className="preCallContent">
+            <div className="logo">🤟</div>
+            <h1>Join Meeting</h1>
+            <p>Enter the meeting code to join</p>
+            
+            <div className="preCallCard">
+              <div className="meetingSection">
+                <h3>Meeting Code</h3>
+                <input 
+                  type="text" 
+                  placeholder="e.g., SL-ABC123DEF"
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                  className="codeInput"
+                  onKeyPress={(e) => e.key === 'Enter' && handleJoinMeeting()}
+                />
+              </div>
+
+              <button className="joinBtn" onClick={handleJoinMeeting}>
+                <span className="icon">📞</span>
+                Join Meeting
+              </button>
+
+              <div className="preCallFooter">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    checked={isMuted}
+                    onChange={(e) => setIsMuted(e.target.checked)}
+                  />
+                  Start with microphone off
+                </label>
+              </div>
+
+              <button className="backBtn" onClick={() => {
+                setScreen('start')
+                setJoinCode('')
+              }}>
+                ← Back
+              </button>
+            </div>
+
+            <div className="statusBadge">
+              Backend: <span className={backendStatus === 'Connected' ? 'status-ok' : 'status-error'}>
+                {backendStatus}
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : (
+        // Active call screen
+        <div className="callView">
+          {/* Main video area */}
+          <div className="mainVideoArea">
+            <div className="videoWrapper">
+              {/* Video element is at app root - positioned absolutely to fill this area */}
+              
+              {/* Detection overlay */}
+              <div className="detectionOverlay">
+                <div className="detectionBox">
+                  <div className="detectedWord">{detected}</div>
+                  <div className="confidenceBar">
+                    <div className="confidenceFill" style={{ width: confidence + '%' }}></div>
+                  </div>
+                  <span className="confidenceText">{confidence}% confidence</span>
+                </div>
+              </div>
+
+              {/* Participant info */}
+              <div className="participantLabel">You (Host)</div>
+            </div>
+
+            {/* Participant grid */}
+            <div className="participantGrid">
+              {participants.slice(1).map((p, i) => (
+                <div key={i} className="participantCard">
+                  <div className="participantPlaceholder">
+                    <span>👤</span>
+                  </div>
+                  <span className="participantName">{p}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Sidebar */}
+          <div className="sidebar">
+            {/* Transcript panel */}
+            <div className="sidebarPanel">
+              <h3>Live Transcript</h3>
+              <div className="transcript">
+                {transcript || 'No signs detected yet...'}
+              </div>
+              <div className="transcriptControls">
+                <button className="sidebarBtn" onClick={clearTranscript}>Clear</button>
+                <button className="sidebarBtn" onClick={downloadTranscript}>Download</button>
+              </div>
+            </div>
+
+            {/* Meeting info */}
+            <div className="sidebarPanel">
+              <h3>Meeting Info</h3>
+              <div className="meetingInfo">
+                <p><strong>Code:</strong> <code>{meetingCode}</code></p>
+                <p><strong>Participants:</strong> {participants.length}</p>
+                <button className="copyBtn small" onClick={copyMeetingCode}>Copy Code</button>
+              </div>
+            </div>
+
+            {/* Detection stats */}
+            <div className="sidebarPanel">
+              <h3>Detection Stats</h3>
+              <div className="stats">
+                <p>Last Sign: <strong>{detected}</strong></p>
+                <p>Confidence: <strong>{confidence}%</strong></p>
+                <p>Status: <strong className={backendStatus === 'Connected' ? 'connected' : 'disconnected'}>
+                  {backendStatus}
+                </strong></p>
+              </div>
+            </div>
+          </div>
+
+          {/* Control bar */}
+          <div className="controlBar">
+            <button className={`controlBtn ${isMuted ? 'disabled' : ''}`} onClick={() => setIsMuted(!isMuted)} title="Toggle Microphone">
+              🎤
+            </button>
+            <button className="controlBtn" onClick={() => alert('Screen share coming soon')} title="Share Screen">
+              🖥️
+            </button>
+            <button className="controlBtn endBtn" onClick={endCall} title="End Call">
+              📞
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App

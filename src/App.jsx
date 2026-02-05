@@ -34,6 +34,7 @@ function App() {
   const [participants, setParticipants] = useState([])
   const [pendingParticipants, setPendingParticipants] = useState([])
   const [isHost, setIsHost] = useState(false)
+  const [toast, setToast] = useState('')  // Toast notification
 
   // Initialize app
   useEffect(() => {
@@ -432,12 +433,14 @@ function App() {
 
   const copyMeetingCode = () => {
     navigator.clipboard.writeText(meetingCode)
-    alert('Meeting code copied!')
+    setToast('Meeting code copied!')
+    setTimeout(() => setToast(''), 2000)
   }
 
   const handleJoinMeeting = () => {
     if (!joinCode.trim()) {
-      alert('Please enter a meeting code')
+      setToast('Please enter a meeting code')
+      setTimeout(() => setToast(''), 2000)
       return
     }
     setMeetingCode(joinCode)
@@ -556,6 +559,13 @@ function App() {
 
   return (
     <div className="app">
+      {/* Toast notification */}
+      {toast && (
+        <div className="toast-notification">
+          {toast}
+        </div>
+      )}
+      
       {/* Hidden video element */}
       <video 
         ref={videoRef}

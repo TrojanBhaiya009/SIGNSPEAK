@@ -38,8 +38,7 @@ __pycache__/
 .env
 .env.local
 
-# ML model files (large)
-*.task
+# ML model files (large) - keep task files and pkl for deployment
 *.h5
 *.keras
 ml-model/

@@ -2,6 +2,8 @@ import { useState, useRef, useEffect } from 'react'
 import { useUser, useAuth, UserButton, SignIn } from '@clerk/clerk-react'
 import './App.css'
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000'
+
 function App() {
   const { user, isLoaded } = useUser()
   const { isSignedIn } = useAuth()
@@ -99,7 +101,7 @@ function App() {
 
   const checkBackendStatus = async () => {
     try {
-      const res = await fetch('http://localhost:5000/health')
+      const res = await fetch(`${BACKEND_URL}/health`)
       if (res.ok) setBackendStatus('Connected')
       else setBackendStatus('Error')
     } catch {
@@ -211,7 +213,7 @@ function App() {
       
       const base64 = tempCanvas.toDataURL('image/jpeg', 0.7).split(',')[1]
       
-      const res = await fetch('http://localhost:5000/predict', {
+      const res = await fetch(`${BACKEND_URL}/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: base64 })
@@ -265,7 +267,7 @@ function App() {
   // Caption control functions
   const clearCaption = async () => {
     try {
-      await fetch('http://localhost:5000/caption/clear', { method: 'POST' })
+      await fetch(`${BACKEND_URL}/caption/clear`, { method: 'POST' })
       setCaption('')
       setTranscript('')  // Also clear transcript
     } catch (e) { console.error(e) }
@@ -273,7 +275,7 @@ function App() {
 
   const addSpace = async () => {
     try {
-      const res = await fetch('http://localhost:5000/caption/space', { method: 'POST' })
+      const res = await fetch(`${BACKEND_URL}/caption/space`, { method: 'POST' })
       const data = await res.json()
       if (data.caption !== undefined) setCaption(data.caption)
     } catch (e) { console.error(e) }
@@ -281,7 +283,7 @@ function App() {
 
   const backspace = async () => {
     try {
-      const res = await fetch('http://localhost:5000/caption/backspace', { method: 'POST' })
+      const res = await fetch(`${BACKEND_URL}/caption/backspace`, { method: 'POST' })
       const data = await res.json()
       if (data.caption !== undefined) setCaption(data.caption)
     } catch (e) { console.error(e) }
@@ -329,7 +331,7 @@ function App() {
         })
 
         try {
-          const response = await fetch('http://localhost:5000/predict', {
+          const response = await fetch(`${BACKEND_URL}/predict`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ image: base64 })

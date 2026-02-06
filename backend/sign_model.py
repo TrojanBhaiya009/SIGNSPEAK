@@ -21,15 +21,12 @@ except Exception as e:
 
 class SignLanguageModel:
     def __init__(self, model_path='sign_model.pkl', classes_path='sign_classes.pkl'):
-        self.model_path = model_path
-        self.classes_path = classes_path
+        # Use absolute path relative to this script's directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.model_path = os.path.join(script_dir, model_path)
+        self.classes_path = os.path.join(script_dir, classes_path)
         self.model = None
         self.scaler = None
-        
-        # Image-based model (trained on ISL dataset)
-        self.img_model = None
-        self.img_scaler = None
-        self.img_size = 64
         
         # ASL Alphabet + common words
         self.alphabet = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
@@ -59,7 +56,6 @@ class SignLanguageModel:
             print("⚠ MediaPipe not available")
         
         self.load_model()
-        self.load_image_model()
     
     def _init_hand_landmarker_fast(self):
         """Initialize hand landmarker with FASTEST settings"""
@@ -78,9 +74,9 @@ class SignLanguageModel:
                 base_options=base_options,
                 running_mode=vision.RunningMode.IMAGE,
                 num_hands=2,  # Detect both hands
-                min_hand_detection_confidence=0.3,
-                min_hand_presence_confidence=0.2,
-                min_tracking_confidence=0.1
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
+                min_tracking_confidence=0.4
             )
             self.hands = vision.HandLandmarker.create_from_options(options)
             self.has_mediapipe = True
@@ -91,7 +87,7 @@ class SignLanguageModel:
             self.has_mediapipe = False
     
     def load_model(self):
-        """Load trained alphabet model"""
+        """Load trained ASL alphabet model"""
         try:
             if os.path.exists(self.model_path):
                 with open(self.model_path, 'rb') as f:
@@ -101,30 +97,11 @@ class SignLanguageModel:
                     saved_classes = model_data.get('classes')
                     if saved_classes:
                         self.classes = saved_classes
-                print(f"✓ Landmark model loaded with {len(self.classes)} classes")
+                print(f"✓ ASL model loaded with {len(self.classes)} classes")
             else:
-                print(f"⚠ No landmark model found")
+                print(f"⚠ No ASL model found at {self.model_path}")
         except Exception as e:
-            print(f"Error loading landmark model: {e}")
-    
-    def load_image_model(self):
-        """Load trained ISL image model"""
-        try:
-            img_model_path = os.path.join(os.path.dirname(__file__), 'sign_model_cnn.pkl')
-            if os.path.exists(img_model_path):
-                with open(img_model_path, 'rb') as f:
-                    model_data = pickle.load(f)
-                    self.img_model = model_data.get('model')
-                    self.img_scaler = model_data.get('scaler')
-                    self.img_size = model_data.get('img_size', 64)
-                    saved_classes = model_data.get('classes')
-                    if saved_classes:
-                        self.classes = saved_classes
-                print(f"✓ ISL Image model loaded (99.9% accuracy)")
-            else:
-                print(f"⚠ No ISL image model found")
-        except Exception as e:
-            print(f"Error loading image model: {e}")
+            print(f"Error loading ASL model: {e}")
     
     def create_dummy_model(self):
         """Create placeholder model"""
@@ -203,8 +180,7 @@ class SignLanguageModel:
         """
         Detect which fingers are extended based on landmark positions
         landmarks: array of 21 x 3 (x, y, z) normalized 0-1
-        Returns: dict with thumb, index, middle, ring, pinky as True/False (extended)
-        Also returns thumb_between_fingers for K detection
+        Returns: dict with various finger states
         """
         if len(landmarks) < 63:
             return None
@@ -216,37 +192,48 @@ class SignLanguageModel:
         # 0: wrist
         # 1-4: thumb (1=cmc, 2=mcp, 3=ip, 4=tip)
         # 5-8: index (5=mcp, 6=pip, 7=dip, 8=tip)
-        # 9-12: middle
+        # 9-12: middle (9=mcp, 10=pip, 11=dip, 12=tip)
         # 13-16: ring
         # 17-20: pinky
         
         fingers = {}
         
-        # Thumb: compare tip x to IP joint x (depends on hand orientation)
-        # If thumb tip is far from palm center, it's extended
+        # Thumb extended: tip is far from palm center (wrist)
         thumb_tip = pts[4]
-        thumb_ip = pts[3]
         palm_center = pts[0]
-        fingers['thumb'] = abs(thumb_tip[0] - palm_center[0]) > 0.1
+        fingers['thumb'] = abs(thumb_tip[0] - palm_center[0]) > 0.12
         
-        # Other fingers: tip higher (lower y) than PIP joint = extended
-        fingers['index'] = pts[8][1] < pts[6][1]
-        fingers['middle'] = pts[12][1] < pts[10][1]
-        fingers['ring'] = pts[16][1] < pts[14][1]
-        fingers['pinky'] = pts[20][1] < pts[18][1]
+        # Finger extended: tip is significantly higher than MCP joint
+        # Use MCP as reference (more reliable than PIP for curved fingers)
+        fingers['index'] = pts[8][1] < pts[5][1] - 0.05
+        fingers['middle'] = pts[12][1] < pts[9][1] - 0.05
+        fingers['ring'] = pts[16][1] < pts[13][1] - 0.05
+        fingers['pinky'] = pts[20][1] < pts[17][1] - 0.05
+        
+        # Detect curved/closed hand (for O, C, E shapes)
+        # All fingertips close together and near thumb
+        fingertips = [pts[4], pts[8], pts[12], pts[16], pts[20]]
+        fingertip_center = np.mean(fingertips, axis=0)
+        fingertip_spread = np.std([p[0] for p in fingertips])  # X spread
+        
+        # O shape: fingertips clustered together (low spread)
+        fingers['fingertips_clustered'] = fingertip_spread < 0.08
+        
+        # Check if fingertips are touching thumb (for O, F)
+        thumb_to_index = np.linalg.norm(pts[4] - pts[8])
+        thumb_to_middle = np.linalg.norm(pts[4] - pts[12])
+        fingers['thumb_touches_index'] = thumb_to_index < 0.08
+        fingers['thumb_touches_middle'] = thumb_to_middle < 0.08
         
         # K detection: thumb tip is between index and middle fingers
-        # Check if thumb tip x is between index tip x and middle tip x
         index_tip_x = pts[8][0]
         middle_tip_x = pts[12][0]
         thumb_tip_x = pts[4][0]
         
-        # Thumb should be horizontally between index and middle
         min_x = min(index_tip_x, middle_tip_x)
         max_x = max(index_tip_x, middle_tip_x)
         thumb_between = min_x < thumb_tip_x < max_x
         
-        # Also check thumb is at similar height (y) to fingers, not too low
         avg_finger_y = (pts[8][1] + pts[12][1]) / 2
         thumb_at_finger_level = abs(thumb_tip[1] - avg_finger_y) < 0.15
         
@@ -257,7 +244,7 @@ class SignLanguageModel:
     def rule_based_letter(self, landmarks):
         """
         Rule-based ASL letter detection from finger states
-        Returns letter and confidence
+        Returns letter and confidence - only for high-confidence patterns
         """
         fingers = self.detect_finger_states(landmarks)
         if not fingers:
@@ -268,80 +255,94 @@ class SignLanguageModel:
         # Count extended fingers
         count = sum([i, m, r, p])  # Exclude thumb from basic count
         
-        # Rule-based letter mapping based on ASL fingerspelling
+        # Only return high-confidence rule-based matches
+        # Let ML model handle ambiguous cases like O, C, E, F, J, M, N, etc.
         letter = None
-        conf = 0.75
+        conf = 0.0
         
-        if not i and not m and not r and not p:  # Fist
+        # FIRST: Check for O/C shapes (curved hand with fingertips clustered)
+        # If fingertips are clustered, let ML model handle it (O, C, E shapes)
+        if fingers.get('fingertips_clustered'):
+            return None, 0.0  # Let ML model decide
+        
+        # Check for thumb touching index (F or O shape) - let ML handle
+        if fingers.get('thumb_touches_index'):
+            return None, 0.0  # Let ML model decide
+        
+        # Now check clear finger patterns
+        if not i and not m and not r and not p:  # All fingers down (fist)
             if t:
                 letter = 'A'  # Fist with thumb out
+                conf = 0.8
             else:
                 letter = 'S'  # Fist with thumb tucked
+                conf = 0.8
                 
-        elif i and not m and not r and not p:  # Only index
+        elif i and not m and not r and not p:  # Only index extended
             if t:
-                letter = 'L'  # L shape
+                letter = 'L'  # L shape - index up, thumb out
+                conf = 0.85
             else:
-                letter = 'D'  # Index up, thumb touching others
+                letter = 'D'  # Index up, thumb not out
+                conf = 0.65
                 
-        elif i and m and not r and not p:  # Index + middle
-            # K: index + middle up with thumb BETWEEN them
+        elif i and m and not r and not p:  # Index + middle extended
             if fingers.get('thumb_between_fingers'):
                 letter = 'K'
-                conf = 0.95  # High confidence for K
+                conf = 0.95
             else:
-                letter = 'V'  # V or U without thumb between
-                conf = 0.75
+                letter = 'V'  # V or U
+                conf = 0.7
             
-        elif i and m and r and not p:  # Index + middle + ring
-            letter = 'W'  # 3 fingers
+        elif i and m and r and not p:  # Index + middle + ring extended
+            letter = 'W'
+            conf = 0.85
             
-        elif not i and not m and not r and p:  # Only pinky
-            letter = 'I'  # Pinky up
+        elif not i and not m and not r and p:  # ONLY pinky truly extended
+            # Make sure it's really just pinky (not curved O/C shape)
+            letter = 'I'
+            conf = 0.85
             
-        elif t and not i and not m and not r and p:  # Thumb + pinky
-            letter = 'Y'  # Hang loose
+        elif t and not i and not m and not r and p:  # Thumb + pinky only
+            letter = 'Y'
+            conf = 0.9
             
-        elif i and m and r and p:  # All 4 fingers
+        elif i and m and r and p:  # All 4 fingers extended
             if t:
-                letter = 'B'  # Flat hand
-            else:
-                letter = '5'  # Open hand (number 5)
-                
-        elif t and i and not m and not r and not p:  # Thumb + index only
-            letter = 'G'  # Thumb and index pointing
-            
-        else:
-            # Default prediction using finger count
-            count_letters = {0: 'S', 1: 'D', 2: 'V', 3: 'W', 4: 'B'}
-            letter = count_letters.get(count, 'A')
-            conf = 0.5
+                letter = 'B'  # Flat hand with thumb
+                conf = 0.8
         
+        # Return None for patterns that should use ML model (O, C, E, F, J, M, N, P, Q, R, T, U, X, Z)
         return letter, conf
 
     def predict_letter_from_landmarks(self, features):
-        """Use rule-based detection first, fall back to ML model"""
-        # Try rule-based first (more reliable)
-        letter, conf = self.rule_based_letter(features)
-        if letter and conf > 0.6:
-            return letter, conf
+        """Use ML model as the PRIMARY source - user trained it with their webcam"""
+        # ALWAYS try ML model first - it was trained on user's actual hand signs
+        ml_letter = None
+        ml_conf = 0.0
         
-        # Fall back to ML model
-        if self.model is None or self.scaler is None:
-            return letter, conf
+        if self.model is not None and self.scaler is not None:
+            try:
+                X = features.reshape(1, -1)
+                X_scaled = self.scaler.transform(X)
+                proba = self.model.predict_proba(X_scaled)[0]
+                ml_conf = np.max(proba)
+                class_idx = np.argmax(proba)
+                ml_letter = self.classes[class_idx]
+            except Exception as e:
+                pass
         
-        try:
-            X = features.reshape(1, -1)
-            X_scaled = self.scaler.transform(X)
-            proba = self.model.predict_proba(X_scaled)[0]
-            confidence = np.max(proba)
-            class_idx = np.argmax(proba)
-            
-            if confidence > self.confidence_threshold:
-                return self.classes[class_idx], confidence
-            return letter, conf  # Return rule-based result if ML not confident
-        except Exception as e:
-            return letter, conf
+        # Trust the ML model - it was trained on user's own hand signs
+        if ml_letter and ml_conf > 0.3:
+            return ml_letter, ml_conf
+        
+        # Only fall back to rule-based for very low confidence
+        rule_letter, rule_conf = self.rule_based_letter(features)
+        if rule_letter and rule_conf > 0.8:
+            return rule_letter, rule_conf
+        
+        # Return ML result even with lower confidence
+        return ml_letter if ml_letter else rule_letter, max(ml_conf, rule_conf)
     
     def update_spelling(self, letter, confidence):
         """Update the spelling buffer - only add when sign is HELD steady"""
@@ -354,10 +355,10 @@ class SignLanguageModel:
         if letter is None:
             return
         
-        # Only add letter if SAME sign held for 0.5 second (faster!)
+        # Only add letter if SAME sign held for 0.2 second (FAST!)
         if letter == self.last_letter:
             time_held = current_time - self.last_letter_time
-            if time_held >= 0.5:  # Hold for half second
+            if time_held >= 0.2:  # Hold for 200ms only
                 # Only add if not already the last letter in buffer
                 if not self.letter_buffer or self.letter_buffer[-1] != letter:
                     self.letter_buffer.append(letter)
@@ -413,122 +414,37 @@ class SignLanguageModel:
             last_word = self.completed_words.pop()
             self.letter_buffer = list(last_word)
             self.current_word = last_word
-    
-    def predict_from_image(self, frame, hand_bbox=None):
-        """Predict letter directly from image using trained ISL model
-        
-        Args:
-            frame: Full BGR image
-            hand_bbox: Optional tuple (x, y, w, h) to crop hand region
-        """
-        if self.img_model is None or self.img_scaler is None:
-            return None, 0.0
-        
-        try:
-            h, w = frame.shape[:2]
-            
-            # If bounding box provided, crop to hand region
-            if hand_bbox:
-                x, y, bw, bh = hand_bbox
-                # Add padding around hand
-                pad = int(max(bw, bh) * 0.2)
-                x1 = max(0, x - pad)
-                y1 = max(0, y - pad)
-                x2 = min(w, x + bw + pad)
-                y2 = min(h, y + bh + pad)
-                cropped = frame[y1:y2, x1:x2]
-            else:
-                cropped = frame
-            
-            # Convert to grayscale
-            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            
-            # Resize to model input size
-            resized = cv2.resize(gray, (self.img_size, self.img_size))
-            
-            # Normalize and flatten
-            normalized = resized.astype(np.float32) / 255.0
-            features = normalized.flatten().reshape(1, -1)
-            
-            # Scale
-            features_scaled = self.img_scaler.transform(features)
-            
-            # Predict
-            proba = self.img_model.predict_proba(features_scaled)[0]
-            confidence = np.max(proba)
-            class_idx = np.argmax(proba)
-            predicted_class = self.classes[class_idx]
-            print(f"[IMG MODEL] Classes: {self.classes}, Predicted: {predicted_class}, Conf: {confidence:.2f}", flush=True)
-            
-            # ALWAYS return prediction from image model - this is YOUR trained model
-            return str(predicted_class), confidence
-        except Exception as e:
-            print(f"Image prediction error: {e}")
-            return None, 0.0
-    
-    def get_hand_bbox(self, keypoints_list):
-        """Get bounding box from hand keypoints (pixel coordinates)"""
-        if not keypoints_list or len(keypoints_list) == 0:
-            return None
-        
-        # Use first hand's keypoints
-        points = np.array(keypoints_list[0])
-        x_min, y_min = points.min(axis=0)
-        x_max, y_max = points.max(axis=0)
-        
-        return (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
 
     def predict_sign(self, frame):
-        """Predict sign with visualization keypoints and caption building"""
+        """Predict ASL sign with visualization keypoints and caption building"""
         keypoints_draw, features, gesture_name, gesture_conf = self.extract_hand_keypoints(frame)
         
-        # If no hands detected by MediaPipe, still try image-based prediction
+        # If no hands detected
         if keypoints_draw is None or len(keypoints_draw) == 0:
-            # Try image-based model
-            if self.img_model is not None:
-                img_letter, img_conf = self.predict_from_image(frame)
-                if img_letter and img_conf > 0.7:
-                    self.update_spelling(img_letter, img_conf)
-                    return img_letter, img_conf, None, self.get_caption()
-            
             # Check for word timeout
             if self.letter_buffer and (time.time() - self.last_letter_time) > self.word_timeout:
                 self._finalize_word()
             return "Waiting for hands...", 0.0, None, self.get_caption()
         
-        # Map gestures to actions/letters
+        # Map gestures to ASL letters
         detected_letter = None
         confidence = 0.0
         
-        # FIRST: Check for K using rule-based (index + middle up = K)
-        # This overrides image model which confuses K with O
+        # Use ASL landmark-based prediction
         if np.any(features):
+            # Try rule-based first for common letters
             rule_letter, rule_conf = self.rule_based_letter(features)
-            print(f"[DEBUG] Rule-based predicts: {rule_letter} ({rule_conf:.2f})", flush=True)
-            # If index+middle are up (K or V), always use K for demo
-            if rule_letter in ['K', 'V'] and rule_conf > 0.5:
-                detected_letter = 'K'
-                confidence = 0.95
-                print(f"[DEBUG] FORCING K detection!", flush=True)
-        
-        # PRIMARY: Use image model for other letters (like O)
-        # IMPORTANT: Crop hand region to match training data
-        if detected_letter is None and self.img_model is not None:
-            hand_bbox = self.get_hand_bbox(keypoints_draw)
-            print(f"[DEBUG] Hand bbox: {hand_bbox}", flush=True)
-            img_letter, img_conf = self.predict_from_image(frame, hand_bbox)
-            print(f"[DEBUG] Image model predicts: {img_letter} ({img_conf:.2f})", flush=True)
-            # ALWAYS use image model result - it's YOUR trained model
-            if img_letter:
-                detected_letter = img_letter
-                confidence = img_conf
-        
-        # ONLY use fallback if NO image model loaded
-        if detected_letter is None and self.img_model is None and np.any(features):
+            
+            # Then use ML model for better accuracy
             ml_letter, ml_conf = self.predict_letter_from_landmarks(features)
-            if ml_letter and len(ml_letter) == 1:
+            
+            # Use ML prediction if confident, otherwise use rule-based
+            if ml_letter and ml_conf > 0.5:
                 detected_letter = ml_letter
                 confidence = ml_conf
+            elif rule_letter and rule_conf > 0.5:
+                detected_letter = rule_letter
+                confidence = rule_conf
         
         # Update spelling
         self.update_spelling(detected_letter, confidence)

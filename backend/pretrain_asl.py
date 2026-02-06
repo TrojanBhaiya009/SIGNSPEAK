@@ -56,13 +56,19 @@ def generate_landmarks_for_letter(letter, num_samples=100):
         elif letter == 'H':  # Index and middle pointing sideways
             landmarks = make_h_shape(landmarks)
             
-        elif letter == 'I':  # Pinky up only
+        elif letter == 'I':  # Pinky up only, fist closed
             landmarks = make_fist(landmarks)
-            landmarks[57:60] = [0.7, 0.2, 0]  # Pinky up
+            # Pinky tip UP (landmark 20 = indices 60:63)
+            landmarks[60:63] = [0.68, 0.2, 0]  # Pinky tip extended up
+            landmarks[51:54] = [0.62, 0.58, 0]  # Pinky MCP
             
-        elif letter == 'J':  # Like I but with motion (static: pinky up, hand tilted)
+        elif letter == 'J':  # Like I but hand tilted, pinky draws J
             landmarks = make_fist(landmarks)
-            landmarks[57:60] = [0.75, 0.25, 0]
+            # Pinky tip to the side/tilted (landmark 20)
+            landmarks[60:63] = [0.72, 0.28, 0]  # Pinky tip extended, tilted
+            landmarks[51:54] = [0.64, 0.56, 0]  # Pinky MCP
+            # Slightly rotated wrist
+            landmarks[0:3] = [0.52, 0.78, 0]
             
         elif letter == 'K':  # Index and middle up in V, thumb between
             landmarks = make_k_shape(landmarks)
@@ -120,40 +126,69 @@ def generate_landmarks_for_letter(letter, num_samples=100):
     return np.array(samples)
 
 def make_fist(landmarks):
-    """Base fist position"""
+    """Base fist position - all fingers curled"""
     # Wrist
     landmarks[0:3] = [0.5, 0.8, 0]
-    # Thumb folded
-    landmarks[9:12] = [0.35, 0.6, 0]
-    landmarks[12] = 0.4
-    # Index curled
-    landmarks[21:24] = [0.45, 0.55, 0]
-    # Middle curled
-    landmarks[33:36] = [0.5, 0.55, 0]
-    # Ring curled
-    landmarks[45:48] = [0.55, 0.55, 0]
-    # Pinky curled
-    landmarks[57:60] = [0.6, 0.6, 0]
+    
+    # Thumb folded across palm
+    landmarks[12:15] = [0.4, 0.58, 0]  # Thumb tip (landmark 4)
+    
+    # All fingertips curled down (tips near palm, below MCP)
+    landmarks[24:27] = [0.42, 0.58, 0]  # Index tip (landmark 8)
+    landmarks[36:39] = [0.48, 0.56, 0]  # Middle tip (landmark 12)
+    landmarks[48:51] = [0.54, 0.58, 0]  # Ring tip (landmark 16)
+    landmarks[60:63] = [0.60, 0.60, 0]  # Pinky tip (landmark 20)
+    
+    # MCP joints
+    landmarks[15:18] = [0.38, 0.52, 0]  # Index MCP
+    landmarks[27:30] = [0.48, 0.50, 0]  # Middle MCP
+    landmarks[39:42] = [0.56, 0.52, 0]  # Ring MCP
+    landmarks[51:54] = [0.62, 0.55, 0]  # Pinky MCP
+    
     return landmarks
 
 def make_flat_hand(landmarks):
-    """Flat hand, all fingers extended up"""
-    landmarks[0:3] = [0.5, 0.85, 0]
-    landmarks[12] = 0.3  # Thumb tip
-    landmarks[21:24] = [0.4, 0.15, 0]  # Index up
-    landmarks[33:36] = [0.5, 0.12, 0]  # Middle up
-    landmarks[45:48] = [0.6, 0.15, 0]  # Ring up
-    landmarks[57:60] = [0.7, 0.2, 0]   # Pinky up
+    """Flat hand, all fingers extended up - used for B"""
+    landmarks[0:3] = [0.5, 0.85, 0]  # Wrist
+    
+    # Thumb tucked to side
+    landmarks[12:15] = [0.32, 0.55, 0]  # Thumb tip
+    
+    # All fingertips UP (low Y value = high position)
+    landmarks[24:27] = [0.38, 0.15, 0]  # Index tip
+    landmarks[36:39] = [0.48, 0.12, 0]  # Middle tip
+    landmarks[48:51] = [0.58, 0.15, 0]  # Ring tip
+    landmarks[60:63] = [0.68, 0.20, 0]  # Pinky tip
+    
+    # MCP joints
+    landmarks[15:18] = [0.38, 0.50, 0]  # Index MCP
+    landmarks[27:30] = [0.48, 0.48, 0]  # Middle MCP
+    landmarks[39:42] = [0.58, 0.50, 0]  # Ring MCP
+    landmarks[51:54] = [0.66, 0.52, 0]  # Pinky MCP
+    
     return landmarks
 
 def make_c_shape(landmarks):
-    """C shape - curved hand"""
-    landmarks[0:3] = [0.5, 0.8, 0]
-    landmarks[9:12] = [0.3, 0.5, 0]   # Thumb curved
-    landmarks[21:24] = [0.35, 0.35, 0]
-    landmarks[33:36] = [0.4, 0.3, 0]
-    landmarks[45:48] = [0.5, 0.35, 0]
-    landmarks[57:60] = [0.6, 0.45, 0]
+    """C shape - curved hand like holding a cup
+    Key feature: fingers curved but NOT touching thumb, form a C
+    """
+    landmarks[0:3] = [0.5, 0.8, 0]  # Wrist
+    
+    # Thumb curved inward but separate from fingers
+    landmarks[12:15] = [0.32, 0.48, 0]  # Thumb tip
+    
+    # Fingertips curved but spread out more than O
+    landmarks[24:27] = [0.38, 0.35, 0]  # Index tip - curved
+    landmarks[36:39] = [0.45, 0.32, 0]  # Middle tip - curved
+    landmarks[48:51] = [0.52, 0.35, 0]  # Ring tip - curved
+    landmarks[60:63] = [0.58, 0.40, 0]  # Pinky tip - curved
+    
+    # MCP joints
+    landmarks[15:18] = [0.35, 0.55, 0]  # Index MCP
+    landmarks[27:30] = [0.45, 0.52, 0]  # Middle MCP
+    landmarks[39:42] = [0.55, 0.55, 0]  # Ring MCP
+    landmarks[51:54] = [0.62, 0.58, 0]  # Pinky MCP
+    
     return landmarks
 
 def make_d_shape(landmarks):
@@ -247,13 +282,26 @@ def make_n_shape(landmarks):
     return landmarks
 
 def make_o_shape(landmarks):
-    """O - all fingers touch thumb"""
-    landmarks[0:3] = [0.5, 0.8, 0]
-    landmarks[9:12] = [0.45, 0.45, 0]
-    landmarks[21:24] = [0.42, 0.42, 0]
-    landmarks[33:36] = [0.48, 0.4, 0]
-    landmarks[45:48] = [0.52, 0.42, 0]
-    landmarks[57:60] = [0.55, 0.45, 0]
+    """O - all fingertips touch thumb in a circle
+    Key feature: all fingertips clustered together near thumb tip
+    """
+    landmarks[0:3] = [0.5, 0.8, 0]  # Wrist
+    
+    # Thumb tip pointing inward
+    landmarks[12:15] = [0.45, 0.42, 0]  # Thumb tip (landmark 4)
+    
+    # All fingertips clustered near thumb - close together!
+    landmarks[24:27] = [0.44, 0.40, 0]  # Index tip (landmark 8)
+    landmarks[36:39] = [0.46, 0.38, 0]  # Middle tip (landmark 12)
+    landmarks[48:51] = [0.48, 0.40, 0]  # Ring tip (landmark 16)
+    landmarks[60:63] = [0.50, 0.42, 0]  # Pinky tip (landmark 20)
+    
+    # Set MCP joints lower (higher Y) to show fingers are curled
+    landmarks[15:18] = [0.35, 0.55, 0]  # Index MCP (landmark 5)
+    landmarks[27:30] = [0.45, 0.52, 0]  # Middle MCP (landmark 9)
+    landmarks[39:42] = [0.55, 0.55, 0]  # Ring MCP (landmark 13)
+    landmarks[51:54] = [0.62, 0.58, 0]  # Pinky MCP (landmark 17)
+    
     return landmarks
 
 def make_p_shape(landmarks):

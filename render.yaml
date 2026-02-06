@@ -3,7 +3,7 @@ services:
     name: sign-language-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class eventlet -w 1 app:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn --worker-class gevent -w 1 app:app --bind 0.0.0.0:$PORT
     rootDir: backend
     envVars:
       - key: PYTHON_VERSION

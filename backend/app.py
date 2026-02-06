@@ -15,8 +15,12 @@ from sign_model import SignLanguageModel
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Initialize Socket.IO with CORS
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# Initialize Socket.IO with CORS - use gevent for production (Render)
+# Falls back to threading if gevent not available
+try:
+    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+except:
+    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Initialize ML model
 model = SignLanguageModel()

@@ -1,1213 +1,822 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { useUser, useAuth, UserButton, SignIn } from '@clerk/clerk-react'
 import { io } from 'socket.io-client'
 import './App.css'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000'
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ],
+}
 
 function App() {
   const { user, isLoaded } = useUser()
   const { isSignedIn } = useAuth()
-  const videoRef = useRef(null)
-  const canvasRef = useRef(null)
+
+  // ── Refs ──
+  const localVideoRef = useRef(null)
+  const previewVideoRef = useRef(null)
+  const socketRef = useRef(null)
+  const localStreamRef = useRef(null)
+  const screenStreamRef = useRef(null)
+  const peersRef = useRef({})
   const handsRef = useRef(null)
-  const cameraRef = useRef(null)
-  const socketRef = useRef(null)  // Socket.io connection
-  
-  // Auth states
-  const [username, setUsername] = useState(user?.username || '')
-  const [isSettingUsername, setIsSettingUsername] = useState(!user?.username)
-  
-  // Meeting states
-  const [screen, setScreen] = useState('home')
-  const [isActive, setIsActive] = useState(false)
-  const [detected, setDetected] = useState('Waiting for hands...')
-  const [confidence, setConfidence] = useState(0)
-  const [transcript, setTranscript] = useState('')
-  const [caption, setCaption] = useState('')  // Live caption from spelling
-  const [backendStatus, setBackendStatus] = useState('Disconnected')
-  const [meetingCode, setMeetingCode] = useState('SL-' + Math.random().toString(36).substr(2, 9).toUpperCase())
+  const aslFrameRef = useRef(null)
+  const chatEndRef = useRef(null)
+
+  // ── Auth ──
+  const [username, setUsername] = useState('')
+  const [isSettingUsername, setIsSettingUsername] = useState(false)
+
+  // ── Screens ──
+  const [screen, setScreen] = useState('home')  // home | preview | call
+  const [backendStatus, setBackendStatus] = useState('checking')
+  const [toast, setToast] = useState('')
+
+  // ── Meeting ──
+  const [meetingCode, setMeetingCode] = useState('')
   const [joinCode, setJoinCode] = useState('')
-  const [isMuted, setIsMuted] = useState(false)
-  const [isVideoOff, setIsVideoOff] = useState(false)
-  const [lastKeypoints, setLastKeypoints] = useState(null)
-  
-  // Participants management
+  const [isHost, setIsHost] = useState(false)
   const [participants, setParticipants] = useState([])
   const [pendingParticipants, setPendingParticipants] = useState([])
-  const [isHost, setIsHost] = useState(false)
-  const [toast, setToast] = useState('')  // Toast notification
-  const [waitingApproval, setWaitingApproval] = useState(false)  // Waiting for host to admit
+  const [waitingApproval, setWaitingApproval] = useState(false)
+  const [meetingMode, setMeetingMode] = useState('create') // create | join
+  const [meetingTime, setMeetingTime] = useState(0)
 
-  // Initialize Socket.io connection
-  useEffect(() => {
-    const socket = io(BACKEND_URL, {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000
-    })
-    
-    socketRef.current = socket
-    
-    socket.on('connect', () => {
-      console.log('Socket connected:', socket.id)
-      setBackendStatus('Connected')
-    })
-    
-    socket.on('disconnect', () => {
-      console.log('Socket disconnected')
-      setBackendStatus('Disconnected')
-    })
-    
-    // Meeting events
-    socket.on('meeting_created', (data) => {
-      console.log('Meeting created:', data)
-      if (data.success) {
-        setParticipants(data.meeting.participants)
-        setPendingParticipants(data.meeting.pending || [])
-      }
-    })
-    
-    socket.on('pending_participant', (data) => {
-      console.log('Pending participant:', data)
-      setPendingParticipants(data.pending || [])
-      setToast(`${data.participant.name} wants to join`)
-      setTimeout(() => setToast(''), 3000)
-    })
-    
-    socket.on('waiting_approval', (data) => {
-      console.log('Waiting for approval:', data)
-      setWaitingApproval(true)
-    })
-    
-    socket.on('participant_admitted', (data) => {
-      console.log('Participant admitted:', data)
-      setParticipants(data.participants || [])
-      setPendingParticipants(data.pending || [])
-      setWaitingApproval(false)
-      // If this is us being admitted, we can now fully join
-      if (data.participant.id === user?.id) {
-        setToast('You have been admitted to the meeting!')
-        setTimeout(() => setToast(''), 3000)
-      }
-    })
-    
-    socket.on('join_rejected', () => {
-      setWaitingApproval(false)
-      setToast('Your request to join was denied')
-      setTimeout(() => setToast(''), 3000)
-      setScreen('home')
-    })
-    
-    socket.on('join_error', (data) => {
-      setToast(data.error || 'Failed to join meeting')
-      setTimeout(() => setToast(''), 3000)
-      setWaitingApproval(false)
-    })
-    
-    socket.on('participant_left', (data) => {
-      console.log('Participant left:', data)
-      setParticipants(data.participants || [])
-    })
-    
-    socket.on('pending_updated', (data) => {
-      setPendingParticipants(data.pending || [])
-    })
-    
-    socket.on('meeting_state', (data) => {
-      if (!data.error) {
-        setParticipants(data.participants || [])
-        setPendingParticipants(data.pending || [])
-      }
-    })
-    
-    return () => {
-      socket.disconnect()
-    }
-  }, [user?.id])
+  // ── Media ──
+  const [isMuted, setIsMuted] = useState(false)
+  const [isVideoOff, setIsVideoOff] = useState(false)
+  const [isScreenSharing, setIsScreenSharing] = useState(false)
 
-  // Initialize app
-  useEffect(() => {
-    if (!isLoaded) return
-    
-    if (!isSignedIn) {
-      setScreen('login')
-      return
-    }
-    
-    checkBackendStatus()
-    const interval = setInterval(checkBackendStatus, 10000)  // Less frequent since socket handles status
-    return () => clearInterval(interval)
-  }, [isLoaded, isSignedIn, user, username])
+  // ── Remote streams ──
+  const [remoteStreams, setRemoteStreams] = useState({})
 
-  // Recording loop - using CLIENT-SIDE MediaPipe for INSTANT detection
-  useEffect(() => {
-    if (screen === 'call' && isActive && videoRef.current && canvasRef.current) {
-      initClientSideDetection()
-    }
-    return () => {
-      if (cameraRef.current) {
-        cameraRef.current.stop()
-        cameraRef.current = null
-      }
-    }
-  }, [screen, isActive])
+  // ── Track when stream is ready ──
+  const [streamReady, setStreamReady] = useState(0)
 
-  // Render loop for hand keypoints
-  useEffect(() => {
-    if (!isActive || screen !== 'call') return
+  // ── Panels ──
+  const [showChat, setShowChat] = useState(false)
+  const [showParticipants, setShowParticipants] = useState(false)
+  const [showInfo, setShowInfo] = useState(false)
 
-    let rafId
-    const renderLoop = () => {
-      const canvas = canvasRef.current
-      const video = videoRef.current
+  // ── Chat ──
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInput, setChatInput] = useState('')
+  const [unreadCount, setUnreadCount] = useState(0)
 
-      if (canvas && video && video.readyState === 4) {
-        const ctx = canvas.getContext('2d')
-        
-        // Draw video without flip
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-        
-        if (lastKeypoints && lastKeypoints.length > 0) {
-          drawHandKeypoints(ctx, lastKeypoints)
-        }
-      }
-      
-      rafId = requestAnimationFrame(renderLoop)
-    }
-    
-    rafId = requestAnimationFrame(renderLoop)
-    return () => cancelAnimationFrame(rafId)
-  }, [isActive, screen, lastKeypoints])
+  // ── ASL ──
+  const [detected, setDetected] = useState('')
+  const [confidence, setConfidence] = useState(0)
+  const [caption, setCaption] = useState('')
+  const [showCaptions, setShowCaptions] = useState(true)
 
-  const checkBackendStatus = async () => {
-    try {
-      const res = await fetch(`${BACKEND_URL}/health`)
-      if (res.ok) setBackendStatus('Connected')
-      else setBackendStatus('Error')
-    } catch {
-      setBackendStatus('Disconnected')
-    }
-  }
+  // ── Socket ID ──
+  const [mySocketId, setMySocketId] = useState('')
 
-  // CLIENT-SIDE MediaPipe detection - INSTANT, no network latency
-  const lastDetectionRef = useRef({ count: 0, lastState: 'waiting' })
-  
-  const initClientSideDetection = async () => {
-    if (!window.Hands || !window.Camera) {
-      console.log('MediaPipe not loaded yet, falling back to server')
-      recordingLoop()
-      return
-    }
+  // ── Helpers ──
+  const flash = useCallback((msg) => {
+    setToast(msg)
+    setTimeout(() => setToast(''), 3000)
+  }, [])
 
-    const hands = new window.Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-    })
-    
-    hands.setOptions({
-      maxNumHands: 2,  // Detect both hands
-      modelComplexity: 0,  // Lite model - fastest
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.4
-    })
+  const generateCode = () => 'SL-' + Math.random().toString(36).substring(2, 11).toUpperCase()
 
-    hands.onResults((results) => {
-      const canvas = canvasRef.current
-      const video = videoRef.current
-      if (!canvas || !video) return
-
-      const ctx = canvas.getContext('2d')
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-
-      const hasHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0
-      
-      // STRONG smoothing: slow to change, fast to update when stable
-      if (hasHands) {
-        // Quick ramp up when hands detected
-        lastDetectionRef.current.count = Math.min(10, lastDetectionRef.current.count + 3)
-      } else {
-        // SLOW ramp down - prevent flickering
-        lastDetectionRef.current.count = Math.max(0, lastDetectionRef.current.count - 1)
-      }
-      
-      // Only change state with strong confidence
-      const shouldShowDetected = lastDetectionRef.current.count >= 4
-      const shouldShowWaiting = lastDetectionRef.current.count <= 1
-
-      if (hasHands) {
-        const keypoints = results.multiHandLandmarks.map(hand => 
-          hand.map(p => [p.x * canvas.width, p.y * canvas.height])
-        )
-        setLastKeypoints(keypoints)
-        drawHandKeypoints(ctx, keypoints)
-        
-        if (shouldShowDetected && lastDetectionRef.current.lastState !== 'detected') {
-          const handCount = results.multiHandLandmarks.length
-          setDetected(handCount === 2 ? '2 Hands detected' : 'Hand detected')
-          setConfidence(85 + handCount * 5)
-          lastDetectionRef.current.lastState = 'detected'
-        }
-        
-        // Send to backend for letter prediction (async, non-blocking)
-        sendImageToBackend()
-      } else {
-        setLastKeypoints(null)
-        if (shouldShowWaiting && lastDetectionRef.current.lastState !== 'waiting') {
-          setDetected('Waiting for hands...')
-          setConfidence(0)
-          lastDetectionRef.current.lastState = 'waiting'
-        }
-      }
-    })
-
-    handsRef.current = hands
-
-    const camera = new window.Camera(videoRef.current, {
-      onFrame: async () => {
-        if (handsRef.current && videoRef.current) {
-          await handsRef.current.send({ image: videoRef.current })
-        }
-      },
-      width: 640,
-      height: 480
-    })
-    
-    cameraRef.current = camera
-    camera.start()
-    console.log('Client-side MediaPipe detection started - INSTANT mode')
-  }
-
-  // Send image to backend for ISL letter prediction
-  const predictionInFlightRef = useRef(false)
-  const sendImageToBackend = async () => {
-    if (predictionInFlightRef.current || !videoRef.current) return
-    
-    predictionInFlightRef.current = true
-    
-    try {
-      // Create small canvas for the hand region
-      const tempCanvas = document.createElement('canvas')
-      tempCanvas.width = 128
-      tempCanvas.height = 128
-      const ctx = tempCanvas.getContext('2d')
-      ctx.drawImage(videoRef.current, 0, 0, 128, 128)
-      
-      const base64 = tempCanvas.toDataURL('image/jpeg', 0.7).split(',')[1]
-      
-      const res = await fetch(`${BACKEND_URL}/predict`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: base64 })
-      })
-      const data = await res.json()
-      
-      if (data.sign && !data.sign.includes('Waiting') && !data.sign.includes('detected')) {
-        setDetected(data.sign)
-        setConfidence(Math.round((data.confidence || 0) * 100))
-      }
-      if (data.caption !== undefined) {
-        setCaption(data.caption)
-        // Always sync transcript with caption
-        setTranscript(data.caption)
-      }
-    } catch (e) { 
-      console.error('Backend prediction error:', e)
-    }
-    
-    predictionInFlightRef.current = false
-  }
-
-  const startCall = async (asHost = true) => {
-    try {
-      const constraints = {
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } }
-      }
-      if (!isMuted) constraints.audio = true
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        setIsActive(true)
-        
-        // If starting as host, create meeting via socket
-        if (asHost && socketRef.current) {
-          setIsHost(true)
-          socketRef.current.emit('create_meeting', {
-            code: meetingCode,
-            host_id: user.id,
-            host_name: username || user.username || 'Anonymous'
-          })
-        }
-        
-        setTimeout(() => setScreen('call'), 100)
-      }
-    } catch (error) {
-      console.error('Camera error:', error)
-      setToast('Cannot access camera: ' + error.message)
-      setTimeout(() => setToast(''), 3000)
-    }
-  }
-
-  const endCall = () => {
-    if (videoRef.current?.srcObject) {
-      videoRef.current.srcObject.getTracks().forEach(track => track.stop())
-    }
-    
-    // Leave meeting via socket
-    if (socketRef.current && meetingCode) {
-      socketRef.current.emit('leave_meeting', {
-        code: meetingCode,
-        participant_id: user.id
-      })
-    }
-    
-    setIsActive(false)
-    setScreen('home')
-    setIsHost(false)
-    setParticipants([])
-    setPendingParticipants([])
-    setWaitingApproval(false)
-  }
-
-  // Caption control functions
-  const clearCaption = async () => {
-    try {
-      await fetch(`${BACKEND_URL}/caption/clear`, { method: 'POST' })
-      setCaption('')
-      setTranscript('')  // Also clear transcript
-    } catch (e) { console.error(e) }
-  }
-
-  const addSpace = async () => {
-    try {
-      const res = await fetch(`${BACKEND_URL}/caption/space`, { method: 'POST' })
-      const data = await res.json()
-      if (data.caption !== undefined) setCaption(data.caption)
-    } catch (e) { console.error(e) }
-  }
-
-  const backspace = async () => {
-    try {
-      const res = await fetch(`${BACKEND_URL}/caption/backspace`, { method: 'POST' })
-      const data = await res.json()
-      if (data.caption !== undefined) setCaption(data.caption)
-    } catch (e) { console.error(e) }
-  }
-
-  // Track if a request is in flight to avoid piling up requests
-  const requestInFlight = useRef(false)
-  const frameCanvasRef = useRef(null)
-
-  const recordingLoop = () => {
-    const videoElement = videoRef.current
-    const canvasElement = canvasRef.current
-
-    if (isActive && videoElement && canvasElement && videoElement.readyState === 4) {
-      // Skip if previous request still pending (non-blocking)
-      if (requestInFlight.current) {
-        setTimeout(recordingLoop, 16) // ~60fps check rate
-        return
-      }
-
-      // Reuse canvas for performance - TINY for speed
-      if (!frameCanvasRef.current) {
-        frameCanvasRef.current = document.createElement('canvas')
-        frameCanvasRef.current.width = 160  // Tiny for speed
-        frameCanvasRef.current.height = 120
-      }
-      const tempCanvas = frameCanvasRef.current
-      const tempCtx = tempCanvas.getContext('2d')
-      tempCtx.drawImage(videoElement, 0, 0, tempCanvas.width, tempCanvas.height)
-
-      requestInFlight.current = true
-
-      // Use lower quality JPEG for faster transfer
-      tempCanvas.toBlob(async (blob) => {
-        if (!blob) {
-          requestInFlight.current = false
-          setTimeout(recordingLoop, 16)
-          return
-        }
-
-        const base64 = await new Promise((resolve) => {
-          const reader = new FileReader()
-          reader.onloadend = () => resolve(reader.result.split(',')[1])
-          reader.readAsDataURL(blob)
-        })
-
-        try {
-          const response = await fetch(`${BACKEND_URL}/predict`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: base64 })
-          })
-          
-          const data = await response.json()
-          setDetected(data.sign || 'Waiting for hands...')
-          setConfidence(Math.round((data.confidence || 0) * 100))
-          
-          if (data.keypoints && data.keypoints.length > 0) {
-            // Scale keypoints to display resolution
-            const scaleX = canvasElement.width / 160
-            const scaleY = canvasElement.height / 120
-            const scaledKeypoints = data.keypoints.map(hand => 
-              hand.map(point => [point[0] * scaleX, point[1] * scaleY])
-            )
-            setLastKeypoints(scaledKeypoints)
-          } else {
-            setLastKeypoints(null)
-          }
-          
-          // Update live caption from backend
-          if (data.caption !== undefined) {
-            setCaption(data.caption)
-          }
-          
-          // Add completed words to transcript
-          if (data.sign && !data.sign.includes('Waiting') && !data.sign.includes('detected') && data.confidence > 0.6) {
-            // Only add whole words, not individual letters
-            if (data.sign.length > 1 && !data.sign.includes('SPACE')) {
-              setTranscript(prev => prev.length > 0 ? prev + ' ' + data.sign : data.sign)
-            }
-          }
-        } catch (error) {
-          console.error('Prediction error:', error)
-        }
-
-        requestInFlight.current = false
-        // Immediately queue next frame
-        setTimeout(recordingLoop, 16)
-      }, 'image/jpeg', 0.5)  // JPEG at 50% quality for faster transfer
-    } else {
-      if (isActive) setTimeout(recordingLoop, 16)
-    }
-  }
-
-  const drawHandKeypoints = (ctx, keypoints) => {
-    const connections = [
-      [0, 1], [1, 2], [2, 3], [3, 4],
-      [0, 5], [5, 6], [6, 7], [7, 8],
-      [0, 9], [9, 10], [10, 11], [11, 12],
-      [0, 13], [13, 14], [14, 15], [15, 16],
-      [0, 17], [17, 18], [18, 19], [19, 20],
-      [5, 9], [9, 13], [13, 17]
-    ]
-
-    keypoints.forEach((hand) => {
-      // Draw gradient connections
-      ctx.lineWidth = 4
-      connections.forEach(([start, end]) => {
-        if (start < hand.length && end < hand.length) {
-          const gradient = ctx.createLinearGradient(
-            hand[start][0], hand[start][1],
-            hand[end][0], hand[end][1]
-          )
-          gradient.addColorStop(0, '#8B5CF6')
-          gradient.addColorStop(1, '#06B6D4')
-          ctx.strokeStyle = gradient
-          ctx.beginPath()
-          ctx.moveTo(hand[start][0], hand[start][1])
-          ctx.lineTo(hand[end][0], hand[end][1])
-          ctx.stroke()
-        }
-      })
-
-      // Draw glowing keypoints
-      hand.forEach((point, idx) => {
-        const gradient = ctx.createRadialGradient(
-          point[0], point[1], 0,
-          point[0], point[1], 12
-        )
-        gradient.addColorStop(0, idx < 5 ? '#F472B6' : '#22D3EE')
-        gradient.addColorStop(0.5, idx < 5 ? 'rgba(244, 114, 182, 0.5)' : 'rgba(34, 211, 238, 0.5)')
-        gradient.addColorStop(1, 'transparent')
-        ctx.fillStyle = gradient
-        ctx.beginPath()
-        ctx.arc(point[0], point[1], 12, 0, 2 * Math.PI)
-        ctx.fill()
-        
-        // Inner dot
-        ctx.fillStyle = '#fff'
-        ctx.beginPath()
-        ctx.arc(point[0], point[1], 4, 0, 2 * Math.PI)
-        ctx.fill()
-      })
-    })
+  const copyMeetingLink = () => {
+    const link = `${window.location.origin}?code=${meetingCode}`
+    navigator.clipboard.writeText(link)
+    flash('Meeting link copied to clipboard')
   }
 
   const copyMeetingCode = () => {
     navigator.clipboard.writeText(meetingCode)
-    setToast('Meeting code copied!')
-    setTimeout(() => setToast(''), 2000)
+    flash('Meeting code copied')
   }
 
-  const handleJoinMeeting = async () => {
-    if (!joinCode.trim()) {
-      setToast('Please enter a meeting code')
-      setTimeout(() => setToast(''), 2000)
-      return
+  // ── Timer ──
+  useEffect(() => {
+    if (screen !== 'call') { setMeetingTime(0); return }
+    const iv = setInterval(() => setMeetingTime((t) => t + 1), 1000)
+    return () => clearInterval(iv)
+  }, [screen])
+
+  const formatTime = (s) => {
+    const m = Math.floor(s / 60)
+    const sec = s % 60
+    return `${m}:${sec.toString().padStart(2, '0')}`
+  }
+
+  // =================================================================
+  // WebRTC helpers
+  // =================================================================
+
+  const createPeerConnectionRef = useRef(null)
+  const handleOfferRef = useRef(null)
+  const removePeerRef = useRef(null)
+
+  const removePeer = useCallback((sid) => {
+    const peer = peersRef.current[sid]
+    if (peer?.pc) peer.pc.close()
+    delete peersRef.current[sid]
+    setRemoteStreams((prev) => { const n = { ...prev }; delete n[sid]; return n })
+  }, [])
+
+  const cleanUpAllPeers = useCallback(() => {
+    Object.keys(peersRef.current).forEach(removePeer)
+  }, [removePeer])
+
+  const createPeerConnection = useCallback(async (remoteSid, remoteUsername, shouldCreateOffer) => {
+    if (peersRef.current[remoteSid]) return
+    const pc = new RTCPeerConnection(ICE_SERVERS)
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current))
     }
-    
-    setMeetingCode(joinCode)
-    setIsHost(false)
-    
-    // Request to join via socket
-    if (socketRef.current) {
-      socketRef.current.emit('join_meeting', {
-        code: joinCode,
-        participant_id: user.id,
-        participant_name: username || user.username || 'Anonymous'
-      })
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) socketRef.current?.emit('ice-candidate', { target: remoteSid, candidate: e.candidate })
     }
-    
-    // Start camera but user will wait for approval
-    await startCall(false)  // Not as host
+
+    pc.ontrack = (e) => {
+      const [stream] = e.streams
+      if (!stream) return
+      peersRef.current[remoteSid] = { ...peersRef.current[remoteSid], stream }
+      setRemoteStreams((prev) => ({ ...prev, [remoteSid]: { stream, username: remoteUsername, audio: true, video: true } }))
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') removePeer(remoteSid)
+    }
+
+    peersRef.current[remoteSid] = { pc, stream: null, username: remoteUsername, audio: true, video: true }
+
+    if (shouldCreateOffer) {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      socketRef.current?.emit('webrtc-offer', { target: remoteSid, offer: pc.localDescription })
+    }
+  }, [removePeer])
+
+  const handleOffer = useCallback(async (data) => {
+    const { from_sid, from_username, offer } = data
+    if (!peersRef.current[from_sid]) await createPeerConnectionRef.current(from_sid, from_username, false)
+    const peer = peersRef.current[from_sid]
+    if (!peer?.pc) return
+    await peer.pc.setRemoteDescription(new RTCSessionDescription(offer))
+    const answer = await peer.pc.createAnswer()
+    await peer.pc.setLocalDescription(answer)
+    socketRef.current?.emit('webrtc-answer', { target: from_sid, answer: peer.pc.localDescription })
+  }, [])
+
+  useEffect(() => {
+    createPeerConnectionRef.current = createPeerConnection
+    handleOfferRef.current = handleOffer
+    removePeerRef.current = removePeer
+  }, [createPeerConnection, handleOffer, removePeer])
+
+  // =================================================================
+  // Socket.IO
+  // =================================================================
+
+  useEffect(() => {
+    const socket = io(BACKEND_URL, { transports: ['websocket', 'polling'], reconnection: true, reconnectionAttempts: 10, reconnectionDelay: 1000 })
+    socketRef.current = socket
+
+    socket.on('connect', () => { setBackendStatus('connected'); setMySocketId(socket.id) })
+    socket.on('disconnect', () => setBackendStatus('disconnected'))
+
+    socket.on('meeting-created', (d) => { if (d.success) { setParticipants(d.meeting.participants); setPendingParticipants(d.meeting.pending || []) } })
+    socket.on('waiting-approval', () => setWaitingApproval(true))
+    socket.on('admitted', (d) => { setWaitingApproval(false); setParticipants(d.participants || []); flash('You have been admitted') })
+    socket.on('rejected', () => { setWaitingApproval(false); flash('Join request denied'); setScreen('home') })
+    socket.on('join-error', (d) => { flash(d.error || 'Failed to join'); setWaitingApproval(false) })
+    socket.on('pending-participant', (d) => { setPendingParticipants(d.pending || []); flash(`${d.participant.username} wants to join`) })
+    socket.on('participants-updated', (d) => { setParticipants(d.participants || []); setPendingParticipants(d.pending || []) })
+
+    socket.on('new-peer', async (d) => { if (d.should_create_offer) await createPeerConnectionRef.current?.(d.sid, d.username, true) })
+    socket.on('webrtc-offer', async (d) => { await handleOfferRef.current?.(d) })
+    socket.on('webrtc-answer', async (d) => { const p = peersRef.current[d.from_sid]; if (p?.pc) await p.pc.setRemoteDescription(new RTCSessionDescription(d.answer)) })
+    socket.on('ice-candidate', async (d) => { const p = peersRef.current[d.from_sid]; if (p?.pc && d.candidate) { try { await p.pc.addIceCandidate(new RTCIceCandidate(d.candidate)) } catch { /* */ } } })
+    socket.on('peer-disconnected', (d) => { removePeerRef.current?.(d.sid) })
+
+    socket.on('peer-media-state', (d) => {
+      setRemoteStreams((prev) => { const ex = prev[d.sid]; if (!ex) return prev; return { ...prev, [d.sid]: { ...ex, audio: d.audio, video: d.video } } })
+      if (peersRef.current[d.sid]) { peersRef.current[d.sid].audio = d.audio; peersRef.current[d.sid].video = d.video }
+    })
+
+    socket.on('chat-message', (msg) => {
+      setChatMessages((prev) => [...prev, msg])
+      // increment unread if chat panel is closed
+      setUnreadCount((prev) => prev + 1)
+    })
+
+    socket.on('prediction', (d) => {
+      if (d.sign) setDetected(d.sign)
+      setConfidence(Math.round((d.confidence || 0) * 100))
+      if (d.caption !== undefined) setCaption(d.caption)
+    })
+
+    return () => { socket.disconnect() }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Username from Clerk ──
+  const userIdRef = useRef(null)
+  useEffect(() => {
+    if (!isLoaded || !user) return
+    if (userIdRef.current === user.id) return
+    userIdRef.current = user.id
+    setUsername(user.username || user.firstName || 'User')
+    setIsSettingUsername(!user.username)
+  }, [isLoaded, user?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Health check ──
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn) return
+    const check = async () => { try { const r = await fetch(`${BACKEND_URL}/health`); setBackendStatus(r.ok ? 'connected' : 'error') } catch { setBackendStatus('disconnected') } }
+    check()
+    const iv = setInterval(check, 15000)
+    return () => clearInterval(iv)
+  }, [isLoaded, isSignedIn])
+
+  // ── Attach local stream to video elements when screens mount or stream changes ──
+  useEffect(() => {
+    if (screen === 'preview' && localStreamRef.current && previewVideoRef.current) {
+      previewVideoRef.current.srcObject = localStreamRef.current
+    }
+    if (screen === 'call' && localStreamRef.current && localVideoRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current
+    }
+  }, [screen, streamReady])
+
+  // ── Chat auto-scroll ──
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages])
+
+  // ── Reset unread when opening chat ──
+  useEffect(() => { if (showChat) setUnreadCount(0) }, [showChat])
+
+  // =================================================================
+  // Media
+  // =================================================================
+
+  const getLocalStream = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true })
+    localStreamRef.current = stream
+    if (localVideoRef.current) localVideoRef.current.srcObject = stream
+    return stream
   }
 
-  const admitParticipant = (participantId) => {
-    if (socketRef.current) {
-      socketRef.current.emit('admit_participant', {
-        code: meetingCode,
-        participant_id: participantId
-      })
+  const toggleMute = () => {
+    const next = !isMuted; setIsMuted(next)
+    localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = !next })
+    socketRef.current?.emit('media-state', { code: meetingCode, audio: !next, video: !isVideoOff })
+  }
+
+  const toggleVideo = () => {
+    const next = !isVideoOff; setIsVideoOff(next)
+    localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = !next })
+    socketRef.current?.emit('media-state', { code: meetingCode, audio: !isMuted, video: !next })
+  }
+
+  const toggleScreenShare = async () => {
+    if (isScreenSharing) {
+      screenStreamRef.current?.getTracks().forEach((t) => t.stop())
+      screenStreamRef.current = null
+      const camTrack = localStreamRef.current?.getVideoTracks()[0]
+      if (camTrack) Object.values(peersRef.current).forEach(({ pc }) => { const s = pc.getSenders().find((s) => s.track?.kind === 'video'); if (s) s.replaceTrack(camTrack) })
+      setIsScreenSharing(false)
+      socketRef.current?.emit('screen-share-stopped', { code: meetingCode })
+    } else {
+      try {
+        const ss = await navigator.mediaDevices.getDisplayMedia({ video: true })
+        screenStreamRef.current = ss
+        const st = ss.getVideoTracks()[0]
+        Object.values(peersRef.current).forEach(({ pc }) => { const s = pc.getSenders().find((s) => s.track?.kind === 'video'); if (s) s.replaceTrack(st) })
+        st.onended = () => toggleScreenShare()
+        setIsScreenSharing(true)
+        socketRef.current?.emit('screen-share-started', { code: meetingCode })
+      } catch { /* cancel */ }
     }
   }
 
-  const rejectParticipant = (participantId) => {
-    if (socketRef.current) {
-      socketRef.current.emit('reject_participant', {
-        code: meetingCode,
-        participant_id: participantId
-      })
+  // =================================================================
+  // ASL detection
+  // =================================================================
+
+  const initASLDetection = () => {
+    if (!window.Hands) return
+    const hands = new window.Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` })
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.4 })
+
+    hands.onResults((results) => {
+      if (results.multiHandLandmarks?.length > 0) {
+        const lm = results.multiHandLandmarks[0]
+        const flat = lm.flatMap((l) => [l.x, l.y, l.z])
+        const wx = flat[0], wy = flat[1], wz = flat[2]
+        const pts = []
+        for (let i = 0; i < 21; i++) pts.push(flat[i * 3] - wx, flat[i * 3 + 1] - wy, flat[i * 3 + 2] - wz)
+        let maxDist = 0
+        for (let i = 0; i < 21; i++) { const d = Math.sqrt(pts[i * 3] ** 2 + pts[i * 3 + 1] ** 2 + pts[i * 3 + 2] ** 2); if (d > maxDist) maxDist = d }
+        const normed = maxDist > 0 ? pts.map((v) => v / maxDist) : pts
+        socketRef.current?.emit('predict-landmarks', { landmarks: normed })
+      }
+    })
+
+    handsRef.current = hands
+    let processing = false
+    const processFrame = async () => {
+      const vid = localVideoRef.current
+      if (!vid || !vid.srcObject || !handsRef.current) { aslFrameRef.current = requestAnimationFrame(processFrame); return }
+      if (vid.readyState >= 2 && !processing) { processing = true; try { await handsRef.current.send({ image: vid }) } catch { /* */ } processing = false }
+      aslFrameRef.current = requestAnimationFrame(processFrame)
     }
+    aslFrameRef.current = requestAnimationFrame(processFrame)
   }
 
-  const clearTranscript = () => setTranscript('')
+  // =================================================================
+  // Caption controls
+  // =================================================================
 
-  const downloadTranscript = () => {
-    const element = document.createElement('a')
-    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(transcript))
-    element.setAttribute('download', 'transcript.txt')
-    element.style.display = 'none'
-    document.body.appendChild(element)
-    element.click()
-    document.body.removeChild(element)
+  const clearCaption = async () => { try { await fetch(`${BACKEND_URL}/caption/clear`, { method: 'POST' }); setCaption('') } catch { /* */ } }
+  const addSpace = async () => { try { const r = await fetch(`${BACKEND_URL}/caption/space`, { method: 'POST' }); const d = await r.json(); if (d.caption !== undefined) setCaption(d.caption) } catch { /* */ } }
+  const doBackspace = async () => { try { const r = await fetch(`${BACKEND_URL}/caption/backspace`, { method: 'POST' }); const d = await r.json(); if (d.caption !== undefined) setCaption(d.caption) } catch { /* */ } }
+
+  // =================================================================
+  // Meeting actions
+  // =================================================================
+
+  const goToPreview = async (mode) => {
+    if (mode === 'create') setMeetingCode(generateCode())
+    setMeetingMode(mode)
+    setScreen('preview')
+    // Start camera for preview
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true })
+      localStreamRef.current = stream
+      setStreamReady((c) => c + 1) // trigger re-attach
+    } catch (e) { flash('Camera error: ' + e.message) }
   }
 
-  // Loading screen
-  if (!isLoaded) {
-    return (
-      <div className="app">
-        <div className="loading-screen">
-          <div className="loading-spinner"></div>
-          <div className="loading-text">Loading...</div>
+  const startMeeting = async () => {
+    try {
+      const code = meetingCode || generateCode()
+      setMeetingCode(code)
+      // Reuse preview stream if available, otherwise get new one
+      if (!localStreamRef.current) await getLocalStream()
+      if (isMuted) localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = false })
+      if (isVideoOff) localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = false })
+      setIsHost(true)
+      socketRef.current?.emit('create-meeting', { code, user_id: user.id, username })
+      setScreen('call')
+      initASLDetection()
+    } catch (e) { flash('Camera error: ' + e.message) }
+  }
+
+  const joinMeeting = async () => {
+    const code = (meetingMode === 'join' ? joinCode : meetingCode).trim()
+    if (!code) { flash('Enter a meeting code'); return }
+    try {
+      setMeetingCode(code)
+      // Reuse preview stream if available, otherwise get new one
+      if (!localStreamRef.current) await getLocalStream()
+      if (isMuted) localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = false })
+      if (isVideoOff) localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = false })
+      setIsHost(false)
+      socketRef.current?.emit('join-meeting', { code, user_id: user.id, username })
+      setScreen('call')
+      initASLDetection()
+    } catch (e) { flash('Camera error: ' + e.message) }
+  }
+
+  const endCall = () => {
+    localStreamRef.current?.getTracks().forEach((t) => t.stop()); localStreamRef.current = null
+    screenStreamRef.current?.getTracks().forEach((t) => t.stop()); screenStreamRef.current = null
+    if (aslFrameRef.current) { cancelAnimationFrame(aslFrameRef.current); aslFrameRef.current = null }
+    cleanUpAllPeers()
+    socketRef.current?.emit('leave-meeting', { code: meetingCode })
+    setScreen('home'); setIsHost(false); setParticipants([]); setPendingParticipants([]); setWaitingApproval(false)
+    setRemoteStreams({}); setChatMessages([]); setCaption(''); setDetected(''); setConfidence(0); setIsScreenSharing(false)
+    setIsMuted(false); setIsVideoOff(false); setShowChat(false); setShowParticipants(false); setShowInfo(false)
+  }
+
+  const admitParticipant = (sid) => socketRef.current?.emit('admit-participant', { code: meetingCode, sid })
+  const rejectParticipant = (sid) => socketRef.current?.emit('reject-participant', { code: meetingCode, sid })
+
+  const sendChat = () => {
+    const text = chatInput.trim()
+    if (!text) return
+    socketRef.current?.emit('chat-message', { code: meetingCode, text, type: 'text' })
+    setChatInput('')
+  }
+
+  // =================================================================
+  // Video grid layout
+  // =================================================================
+
+  const remoteEntries = Object.entries(remoteStreams)
+  const totalVideos = 1 + remoteEntries.length
+  const gridClass = totalVideos <= 1 ? 'g-1' : totalVideos <= 2 ? 'g-2' : totalVideos <= 4 ? 'g-4' : totalVideos <= 6 ? 'g-6' : 'g-many'
+
+  // Right panel open?
+  const sidebarOpen = showChat || showParticipants || showInfo
+
+  // =================================================================
+  // Render
+  // =================================================================
+
+  if (!isLoaded) return (
+    <div className="gm-app">
+      <div className="gm-loader"><div className="gm-spinner" /><p>Loading SignSpeak...</p></div>
+    </div>
+  )
+
+  if (!isSignedIn) return (
+    <div className="gm-app">
+      <div className="gm-login">
+        <div className="gm-login-card">
+          <div className="gm-login-logo">🤟</div>
+          <h1>SignSpeak</h1>
+          <p>Real-time ASL recognition in video calls</p>
+          <SignIn appearance={{ elements: { rootBox: { width: '100%', maxWidth: '400px' }, card: { background: '#fff', borderRadius: '16px', border: 'none' } } }} />
         </div>
       </div>
-    )
-  }
+    </div>
+  )
 
-  // Login screen
-  if (!isSignedIn) {
-    return (
-      <div className="app">
-        <div className="login-screen">
-          <div className="login-container">
-            <div className="login-icon">🤟</div>
-            <h1 className="login-title">SignSpeak</h1>
-            <p className="login-subtitle">Real-time sign language recognition powered by AI</p>
-            <SignIn 
-              appearance={{
-                elements: {
-                  rootBox: { width: '100%', maxWidth: '420px' },
-                  card: { background: 'rgba(15, 23, 42, 0.8)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '24px' },
-                  formButtonPrimary: { background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' },
-                  formFieldInput: { background: 'rgba(0,0,0,0.3)', borderColor: 'rgba(255,255,255,0.1)' }
-                }
-              }}
-            />
-          </div>
+  if (isSettingUsername) return (
+    <div className="gm-app">
+      <div className="gm-login">
+        <div className="gm-login-card">
+          <h2>Welcome! 👋</h2>
+          <p style={{ marginBottom: 24 }}>Choose a display name</p>
+          <input className="gm-input" placeholder="Your name" value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && username.trim() && setIsSettingUsername(false)} />
+          <button className="gm-btn gm-btn-primary" style={{ marginTop: 16, width: '100%' }} onClick={() => { if (username.trim()) setIsSettingUsername(false) }}>Continue</button>
         </div>
       </div>
-    )
-  }
+    </div>
+  )
 
-  // Username setup
-  if (isSettingUsername) {
-    return (
-      <div className="app">
-        <div className="page">
-          <div className="page-card">
-            <div className="page-header">
-              <div className="page-icon">👋</div>
-              <h1 className="page-title">Welcome!</h1>
-              <p className="page-subtitle">Choose a username to get started</p>
+  // ────────────────────────────────────────────────────────
+  // HOME SCREEN (Google Meet landing)
+  // ────────────────────────────────────────────────────────
+
+  if (screen === 'home') return (
+    <div className="gm-app">
+      {toast && <div className="gm-toast">{toast}</div>}
+      {/* Top bar */}
+      <header className="gm-topbar">
+        <div className="gm-topbar-brand">
+          <span className="gm-logo">🤟</span>
+          <span className="gm-brand-name">SignSpeak</span>
+        </div>
+        <div className="gm-topbar-time">{new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</div>
+        <div className="gm-topbar-actions">
+          <div className={`gm-status-dot ${backendStatus === 'connected' ? 'on' : 'off'}`} title={`AI: ${backendStatus}`} />
+          <UserButton />
+        </div>
+      </header>
+
+      {/* Main content */}
+      <main className="gm-home">
+        <div className="gm-home-left">
+          <h1 className="gm-home-title">Video calls with <span className="gm-highlight">sign language AI</span></h1>
+          <p className="gm-home-subtitle">SignSpeak uses real-time ASL recognition to make video meetings accessible to everyone.</p>
+
+          <div className="gm-home-actions">
+            <button className="gm-btn gm-btn-primary gm-btn-new" onClick={() => goToPreview('create')}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+              New meeting
+            </button>
+
+            <div className="gm-join-input-wrap">
+              <svg className="gm-join-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0110 0v4" /></svg>
+              <input className="gm-join-input" placeholder="Enter a code or link" value={joinCode} onChange={(e) => setJoinCode(e.target.value.toUpperCase())} onKeyDown={(e) => { if (e.key === 'Enter' && joinCode.trim()) goToPreview('join') }} />
+              {joinCode.trim() && <button className="gm-btn gm-btn-text" onClick={() => goToPreview('join')}>Join</button>}
             </div>
-            
-            <div className="form-group">
-              <label className="form-label">Username</label>
-              <input
-                type="text"
-                className="form-input"
-                placeholder="Enter your username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
+          </div>
+        </div>
+
+        <div className="gm-home-right">
+          <div className="gm-illustration">
+            <div className="gm-illust-card">
+              <div className="gm-illust-icon">🤟</div>
+              <p>Start or join a meeting to begin using ASL recognition</p>
             </div>
-            
-            <button 
-              className="btn btn-gradient" 
-              style={{ width: '100%' }}
-              onClick={() => {
-                if (username.trim()) {
-                  setIsSettingUsername(false)
-                  setScreen('home')
-                } else {
-                  alert('Username cannot be empty')
-                }
-              }}
-            >
-              <span className="icon">🚀</span>
-              Continue
+          </div>
+        </div>
+      </main>
+
+      {/* Feature cards */}
+      <section className="gm-features">
+        {[
+          ['🎥', 'HD Video', 'Crystal-clear peer-to-peer video with WebRTC'],
+          ['🤖', 'ASL Detection', 'Real-time sign language recognition powered by ML'],
+          ['💬', 'Live Captions', 'Auto-generated captions from detected signs'],
+          ['🖥️', 'Screen Share', 'Share your screen with one click'],
+          ['👥', 'Multi-Party', 'Support for multiple participants in a call'],
+          ['🔒', 'Secure', 'End-to-end encrypted with unique meeting codes'],
+        ].map(([icon, title, desc]) => (
+          <div className="gm-feat-card" key={title}>
+            <span className="gm-feat-icon">{icon}</span>
+            <strong>{title}</strong>
+            <span className="gm-feat-desc">{desc}</span>
+          </div>
+        ))}
+      </section>
+    </div>
+  )
+
+  // ────────────────────────────────────────────────────────
+  // PREVIEW SCREEN (before joining)
+  // ────────────────────────────────────────────────────────
+
+  if (screen === 'preview') return (
+    <div className="gm-app">
+      {toast && <div className="gm-toast">{toast}</div>}
+      <header className="gm-topbar">
+        <div className="gm-topbar-brand" onClick={() => setScreen('home')} style={{ cursor: 'pointer' }}>
+          <span className="gm-logo">🤟</span><span className="gm-brand-name">SignSpeak</span>
+        </div>
+        <div className="gm-topbar-actions"><UserButton /></div>
+      </header>
+
+      <div className="gm-preview">
+        <div className="gm-preview-video-wrap">
+          <div className="gm-preview-video-box">
+            <video ref={previewVideoRef} autoPlay playsInline muted className={`gm-preview-vid ${isVideoOff ? 'hidden' : ''}`} />
+            {isVideoOff && <div className="gm-preview-placeholder"><span className="gm-avatar-lg">{username?.[0]?.toUpperCase() || '?'}</span></div>}
+          </div>
+          <div className="gm-preview-controls">
+            <button className={`gm-ctrl-btn ${isMuted ? 'off' : ''}`} onClick={() => { const next = !isMuted; setIsMuted(next); localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = !next }) }} title={isMuted ? 'Unmute' : 'Mute'}>
+              {isMuted
+                ? <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M1.5 4.5l21 15m-21 0l21-15M12 1a3 3 0 00-3 3v4.5M15 9.34V4a3 3 0 00-5.94-.6M9 9v3a3 3 0 005.12 2.12M19 10v2a7 7 0 01-.11 1.23M5 10v2a7 7 0 0011.47 5.38M12 19v3m-4 0h8" /></svg>
+                : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" /><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" /></svg>
+              }
+            </button>
+            <button className={`gm-ctrl-btn ${isVideoOff ? 'off' : ''}`} onClick={() => { const next = !isVideoOff; setIsVideoOff(next); localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = !next }) }} title={isVideoOff ? 'Turn on camera' : 'Turn off camera'}>
+              {isVideoOff
+                ? <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M1 1l22 22M17 17H5a2 2 0 01-2-2V7a2 2 0 012-2h2m10 0h1a2 2 0 012 2v4l4-2.5v7" /></svg>
+                : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+              }
             </button>
           </div>
         </div>
-      </div>
-    )
-  }
 
-  return (
-    <div className="app">
-      {/* Toast notification */}
-      {toast && (
-        <div className="toast-notification">
-          {toast}
-        </div>
-      )}
-      
-      {/* Hidden video element */}
-      <video 
-        ref={videoRef}
-        autoPlay 
-        playsInline
-        muted
-        style={{ 
-          position: 'absolute',
-          opacity: screen === 'call' ? 1 : 0,
-          pointerEvents: 'none',
-          width: '1px',
-          height: '1px'
-        }}
-      />
-      
-      {/* Navbar - show on all pages except call */}
-      {screen !== 'call' && (
-        <nav className="navbar">
-          <div className="nav-brand">
-            <span className="logo-icon">🤟</span>
-            <span>SignSpeak</span>
-          </div>
-          
-          <div className="nav-links">
-            <button 
-              className={`nav-link ${screen === 'home' ? 'active' : ''}`}
-              onClick={() => setScreen('home')}
-            >
-              Home
-            </button>
-            <button 
-              className={`nav-link ${screen === 'create' ? 'active' : ''}`}
-              onClick={() => setScreen('create')}
-            >
-              Create Meeting
-            </button>
-            <button 
-              className={`nav-link ${screen === 'join' ? 'active' : ''}`}
-              onClick={() => setScreen('join')}
-            >
-              Join Meeting
-            </button>
-            <button 
-              className={`nav-link ${screen === 'about' ? 'active' : ''}`}
-              onClick={() => setScreen('about')}
-            >
-              About
-            </button>
-          </div>
-          
-          <div className="nav-user">
-            <span className="nav-username">{username || user?.username}</span>
-            <UserButton />
-          </div>
-        </nav>
-      )}
-
-      {/* HOME PAGE */}
-      {screen === 'home' && (
-        <>
-          <div className="hero-page">
-            <div className="hero-content">
-              <div className="hero-badge">
-                <span className="dot"></span>
-                <span>AI-Powered Recognition</span>
-              </div>
-              
-              <div className="hero-icon">🤟</div>
-              
-              <h1 className="hero-title">
-                Breaking Barriers<br />Through Signs
-              </h1>
-              
-              <p className="hero-subtitle">
-                Experience seamless communication with our real-time sign language 
-                recognition technology. Connect, communicate, and collaborate without limits.
-              </p>
-              
-              <div className="hero-buttons">
-                <button className="btn btn-gradient" onClick={() => setScreen('create')}>
-                  <span className="icon">🎬</span>
-                  Start Meeting
+        <div className="gm-preview-join">
+          <h2>{meetingMode === 'create' ? 'Ready to start?' : 'Ready to join?'}</h2>
+          {meetingMode === 'join' && (
+            <div className="gm-preview-code">
+              <label>Meeting code</label>
+              <input className="gm-input" value={joinCode} onChange={(e) => setJoinCode(e.target.value.toUpperCase())} placeholder="SL-XXXXXXXXX" />
+            </div>
+          )}
+          {meetingMode === 'create' && (
+            <div className="gm-preview-code">
+              <label>Your meeting code</label>
+              <div className="gm-code-row">
+                <span className="gm-code-display">{meetingCode}</span>
+                <button className="gm-btn gm-btn-icon" onClick={copyMeetingCode} title="Copy code">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
                 </button>
-                <button className="btn btn-secondary" onClick={() => setScreen('join')}>
-                  <span className="icon">🔗</span>
-                  Join Meeting
-                </button>
-              </div>
-              
-              <div className="status-badge">
-                <span className={`status-dot ${backendStatus === 'Connected' ? 'connected' : 'disconnected'}`}></span>
-                <span>AI Engine:</span>
-                <span className={`status-text ${backendStatus === 'Connected' ? 'connected' : 'disconnected'}`}>
-                  {backendStatus}
-                </span>
-              </div>
-            </div>
-          </div>
-          
-          <div className="features-section">
-            <h2 className="section-title">Why SignSpeak?</h2>
-            <p className="section-subtitle">Powerful features designed for seamless communication</p>
-            
-            <div className="features-grid">
-              <div className="feature-card" onClick={() => setScreen('create')}>
-                <div className="feature-icon">🎥</div>
-                <h3 className="feature-title">Video Meetings</h3>
-                <p className="feature-desc">
-                  High-quality video conferencing with real-time sign language detection and transcription.
-                </p>
-              </div>
-              
-              <div className="feature-card" onClick={() => setScreen('create')}>
-                <div className="feature-icon">🤖</div>
-                <h3 className="feature-title">AI Recognition</h3>
-                <p className="feature-desc">
-                  Advanced machine learning models detect hand gestures with incredible accuracy.
-                </p>
-              </div>
-              
-              <div className="feature-card" onClick={() => setScreen('create')}>
-                <div className="feature-icon">📝</div>
-                <h3 className="feature-title">Live Transcription</h3>
-                <p className="feature-desc">
-                  Automatic transcription of detected signs into readable text in real-time.
-                </p>
-              </div>
-              
-              <div className="feature-card" onClick={() => setScreen('profile')}>
-                <div className="feature-icon">👥</div>
-                <h3 className="feature-title">Team Collaboration</h3>
-                <p className="feature-desc">
-                  Invite participants, manage meetings, and collaborate seamlessly.
-                </p>
-              </div>
-            </div>
-          </div>
-        </>
-      )}
-
-      {/* CREATE MEETING PAGE */}
-      {screen === 'create' && (
-        <div className="page">
-          <div className="page-card">
-            <div className="page-header">
-              <div className="page-icon">🎬</div>
-              <h1 className="page-title">Create Meeting</h1>
-              <p className="page-subtitle">Share the code with participants</p>
-            </div>
-            
-            <div className="form-group">
-              <label className="form-label">Meeting Code</label>
-              <div className="input-group">
-                <input 
-                  type="text" 
-                  className="form-input code" 
-                  value={meetingCode} 
-                  readOnly 
-                />
-                <button className="copy-btn" onClick={copyMeetingCode}>📋 Copy</button>
-              </div>
-            </div>
-            
-            <div className="checkbox-group">
-              <input 
-                type="checkbox" 
-                id="muted"
-                checked={isMuted}
-                onChange={(e) => setIsMuted(e.target.checked)}
-              />
-              <label htmlFor="muted">Start with microphone muted</label>
-            </div>
-            
-            <button className="btn btn-gradient" style={{ width: '100%' }} onClick={startCall}>
-              <span className="icon">📞</span>
-              Start Meeting
-            </button>
-            
-            <button className="back-btn" onClick={() => setScreen('home')}>
-              ← Back to Home
-            </button>
-            
-            <div className="status-badge">
-              <span className={`status-dot ${backendStatus === 'Connected' ? 'connected' : 'disconnected'}`}></span>
-              <span>AI:</span>
-              <span className={`status-text ${backendStatus === 'Connected' ? 'connected' : 'disconnected'}`}>
-                {backendStatus}
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* JOIN MEETING PAGE */}
-      {screen === 'join' && (
-        <div className="page">
-          <div className="page-card">
-            <div className="page-header">
-              <div className="page-icon">🔗</div>
-              <h1 className="page-title">Join Meeting</h1>
-              <p className="page-subtitle">Enter the meeting code to join</p>
-            </div>
-            
-            <div className="form-group">
-              <label className="form-label">Meeting Code</label>
-              <input 
-                type="text" 
-                className="form-input code" 
-                placeholder="e.g., SL-ABC123XYZ"
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                onKeyPress={(e) => e.key === 'Enter' && handleJoinMeeting()}
-              />
-            </div>
-            
-            <div className="checkbox-group">
-              <input 
-                type="checkbox" 
-                id="muted-join"
-                checked={isMuted}
-                onChange={(e) => setIsMuted(e.target.checked)}
-              />
-              <label htmlFor="muted-join">Join with microphone muted</label>
-            </div>
-            
-            <button className="btn btn-primary" style={{ width: '100%' }} onClick={handleJoinMeeting}>
-              <span className="icon">🚀</span>
-              Join Meeting
-            </button>
-            
-            <button className="back-btn" onClick={() => setScreen('home')}>
-              ← Back to Home
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ABOUT PAGE */}
-      {screen === 'about' && (
-        <div className="page">
-          <div className="page-card" style={{ maxWidth: '600px' }}>
-            <div className="page-header">
-              <div className="page-icon">ℹ️</div>
-              <h1 className="page-title">About SignSpeak</h1>
-              <p className="page-subtitle">Empowering communication through technology</p>
-            </div>
-            
-            <div style={{ color: 'var(--text-muted)', lineHeight: '1.8', marginBottom: '24px' }}>
-              <p style={{ marginBottom: '16px' }}>
-                <strong style={{ color: 'var(--secondary-light)' }}>SignSpeak</strong> is an innovative 
-                platform that uses artificial intelligence to recognize sign language in real-time during 
-                video calls.
-              </p>
-              <p style={{ marginBottom: '16px' }}>
-                Our mission is to break down communication barriers and make video conferencing accessible 
-                to everyone, regardless of how they communicate.
-              </p>
-              <p>
-                Built with ❤️ using React, Python, MediaPipe, and machine learning.
-              </p>
-            </div>
-            
-            <div style={{ 
-              display: 'grid', 
-              gridTemplateColumns: 'repeat(3, 1fr)', 
-              gap: '16px', 
-              marginBottom: '24px' 
-            }}>
-              <div style={{ 
-                textAlign: 'center', 
-                padding: '20px', 
-                background: 'var(--glass)', 
-                borderRadius: '16px' 
-              }}>
-                <div style={{ fontSize: '32px', marginBottom: '8px' }}>🤖</div>
-                <div style={{ fontSize: '24px', fontWeight: '800', color: 'var(--primary-light)' }}>AI</div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Powered</div>
-              </div>
-              <div style={{ 
-                textAlign: 'center', 
-                padding: '20px', 
-                background: 'var(--glass)', 
-                borderRadius: '16px' 
-              }}>
-                <div style={{ fontSize: '32px', marginBottom: '8px' }}>⚡</div>
-                <div style={{ fontSize: '24px', fontWeight: '800', color: 'var(--secondary-light)' }}>Real</div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Time</div>
-              </div>
-              <div style={{ 
-                textAlign: 'center', 
-                padding: '20px', 
-                background: 'var(--glass)', 
-                borderRadius: '16px' 
-              }}>
-                <div style={{ fontSize: '32px', marginBottom: '8px' }}>🌍</div>
-                <div style={{ fontSize: '24px', fontWeight: '800', color: 'var(--accent-light)' }}>Open</div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Source</div>
-              </div>
-            </div>
-            
-            <button className="back-btn" onClick={() => setScreen('home')}>
-              ← Back to Home
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* PROFILE PAGE */}
-      {screen === 'profile' && (
-        <div className="page">
-          <div className="page-card">
-            <div className="page-header">
-              <div className="page-icon">👤</div>
-              <h1 className="page-title">Your Profile</h1>
-            </div>
-            
-            <div className="profile-avatar-section">
-              <img src={user?.imageUrl} alt="Avatar" className="profile-avatar" />
-              <p className="profile-email">{user?.emailAddresses[0]?.emailAddress}</p>
-            </div>
-            
-            <div className="form-group">
-              <label className="form-label">Username</label>
-              <input
-                type="text"
-                className="form-input"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Enter username"
-              />
-            </div>
-            
-            <button 
-              className="btn btn-gradient" 
-              style={{ width: '100%' }} 
-              onClick={() => setScreen('home')}
-            >
-              <span className="icon">💾</span>
-              Save & Go Home
-            </button>
-            
-            <button className="back-btn" onClick={() => setScreen('home')}>
-              ← Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* CALL VIEW */}
-      {screen === 'call' && (
-        <div className="call-view">
-          {/* Waiting for approval overlay */}
-          {waitingApproval && !isHost && (
-            <div className="waiting-approval-overlay">
-              <div className="waiting-approval-card">
-                <div className="waiting-spinner"></div>
-                <h2>Waiting for Host</h2>
-                <p>The host will let you in soon...</p>
-                <button className="btn btn-secondary" onClick={endCall}>Cancel</button>
               </div>
             </div>
           )}
-          
-          {/* Header */}
-          <div className="call-header">
-            <div className="call-info">
-              <span className="call-code">{meetingCode}</span>
-              <span className="call-participants-count">
-                <span>{participants.length}</span> participant{participants.length !== 1 ? 's' : ''}
-              </span>
+          <p className="gm-preview-info">No one else is here yet</p>
+          <button className="gm-btn gm-btn-primary gm-btn-lg" onClick={meetingMode === 'create' ? startMeeting : joinMeeting}>
+            {meetingMode === 'create' ? 'Start meeting' : 'Join now'}
+          </button>
+          <button className="gm-btn gm-btn-text" onClick={() => { localStreamRef.current?.getTracks().forEach((t) => t.stop()); localStreamRef.current = null; setScreen('home') }}>← Back</button>
+        </div>
+      </div>
+    </div>
+  )
+
+  // ────────────────────────────────────────────────────────
+  // CALL SCREEN (Google Meet in-call)
+  // ────────────────────────────────────────────────────────
+
+  return (
+    <div className="gm-app gm-in-call">
+      {toast && <div className="gm-toast">{toast}</div>}
+
+      {/* Waiting overlay */}
+      {waitingApproval && (
+        <div className="gm-waiting-overlay">
+          <div className="gm-waiting-card">
+            <div className="gm-spinner" />
+            <h3>Asking to be let in...</h3>
+            <p>The host will let you in soon</p>
+            <button className="gm-btn gm-btn-text" onClick={endCall}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Video area */}
+      <div className={`gm-call-main ${sidebarOpen ? 'with-panel' : ''}`}>
+        <div className={`gm-video-grid ${gridClass}`}>
+          {/* Local tile */}
+          <div className={`gm-tile ${totalVideos === 1 ? 'gm-tile-solo' : ''}`}>
+            <video ref={localVideoRef} autoPlay playsInline muted className={`gm-tile-video ${isVideoOff ? 'hidden' : ''}`} />
+            {isVideoOff && <div className="gm-tile-avatar"><span className="gm-avatar">{username?.[0]?.toUpperCase() || '?'}</span></div>}
+            <div className="gm-tile-bar">
+              <span className="gm-tile-name">{username} (You)</span>
+              {isMuted && <span className="gm-tile-muted">🔇</span>}
             </div>
-            <button className="btn btn-danger" onClick={endCall}>
-              <span className="icon">📞</span>
-              End Call
+            {isHost && <span className="gm-host-tag">Host</span>}
+          </div>
+
+          {/* Remote tiles */}
+          {remoteEntries.map(([sid, remote]) => (
+            <RemoteVideo key={sid} remote={remote} />
+          ))}
+        </div>
+
+        {/* ASL Detection badge */}
+        {detected && (
+          <div className="gm-detect-badge">
+            <span className="gm-detect-letter">{detected}</span>
+            <div className="gm-detect-bar"><div className="gm-detect-fill" style={{ width: confidence + '%' }} /></div>
+            <span className="gm-detect-conf">{confidence}%</span>
+          </div>
+        )}
+
+        {/* Caption */}
+        {showCaptions && caption && (
+          <div className="gm-caption-bar">
+            <span className="gm-caption-text">{caption}</span>
+            <div className="gm-caption-actions">
+              <button onClick={doBackspace} title="Backspace">⌫</button>
+              <button onClick={addSpace} title="Space">_</button>
+              <button onClick={clearCaption} title="Clear">✕</button>
+            </div>
+          </div>
+        )}
+
+        {/* Bottom control bar */}
+        <div className="gm-controls">
+          <div className="gm-controls-left">
+            <span className="gm-meeting-id" onClick={copyMeetingCode} title="Click to copy">{meetingCode}</span>
+            <span className="gm-meeting-timer">{formatTime(meetingTime)}</span>
+          </div>
+
+          <div className="gm-controls-center">
+            <button className={`gm-ctrl-btn ${isMuted ? 'off' : ''}`} onClick={toggleMute} title={isMuted ? 'Unmute' : 'Mute'}>
+              {isMuted
+                ? <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M1.5 4.5l21 15m-21 0l21-15M12 1a3 3 0 00-3 3v4.5M15 9.34V4a3 3 0 00-5.94-.6M9 9v3a3 3 0 005.12 2.12M19 10v2a7 7 0 01-.11 1.23M5 10v2a7 7 0 0011.47 5.38M12 19v3m-4 0h8" /></svg>
+                : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" /><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" /></svg>
+              }
+            </button>
+            <button className={`gm-ctrl-btn ${isVideoOff ? 'off' : ''}`} onClick={toggleVideo} title={isVideoOff ? 'Turn on camera' : 'Turn off camera'}>
+              {isVideoOff
+                ? <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M1 1l22 22M17 17H5a2 2 0 01-2-2V7a2 2 0 012-2h2m10 0h1a2 2 0 012 2v4l4-2.5v7" /></svg>
+                : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+              }
+            </button>
+            <button className={`gm-ctrl-btn ${isScreenSharing ? 'sharing' : ''}`} onClick={toggleScreenShare} title={isScreenSharing ? 'Stop presenting' : 'Present now'}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" /></svg>
+            </button>
+            <button className={`gm-ctrl-btn ${showCaptions ? 'active' : ''}`} onClick={() => setShowCaptions(!showCaptions)} title="Toggle captions">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="4" width="20" height="16" rx="2" /><path d="M7 12h2m4 0h4M7 16h10" /></svg>
+            </button>
+            <button className="gm-ctrl-btn gm-end-btn" onClick={endCall} title="Leave call">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.956.956 0 010-1.36C3.69 8.68 7.62 7 12 7s8.31 1.68 11.71 4.72c.37.37.37.98 0 1.36l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28-.79-.73-1.68-1.36-2.66-1.85a.994.994 0 01-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z" /></svg>
             </button>
           </div>
 
-          {/* Main video area */}
-          <div className="main-video-area">
-            <div className="video-wrapper">
-              {isVideoOff ? (
-                <div className="video-off-placeholder">
-                  <span className="icon">📷</span>
-                  <span className="text">Camera is off</span>
-                </div>
-              ) : (
-                <canvas 
-                  ref={canvasRef}
-                  width="1280"
-                  height="720"
-                  className="main-canvas"
-                />
-              )}
-              
-              {/* Detection overlay */}
-              <div className="detection-overlay">
-                <div className="detection-card">
-                  <div className="detected-sign">{detected}</div>
-                  <div className="confidence-bar">
-                    <div className="confidence-fill" style={{ width: confidence + '%' }}></div>
-                  </div>
-                  <span className="confidence-text">{confidence}% confidence</span>
-                </div>
-              </div>
-
-              {/* Live Caption Display */}
-              {caption && (
-                <div className="caption-overlay">
-                  <div className="caption-text">{caption}</div>
-                  <div className="caption-controls">
-                    <button onClick={backspace} title="Backspace">⌫</button>
-                    <button onClick={addSpace} title="Add Space">␣</button>
-                    <button onClick={clearCaption} title="Clear">✕</button>
-                  </div>
-                </div>
-              )}
-
-              {/* Gesture popup */}
-              {detected && (detected.includes('LOVE') || detected.includes('HELLO')) && (
-                <div className="gesture-popup">
-                  {detected === 'LOVE' ? '💜 LOVE' : '👋 HELLO'}
-                </div>
-              )}
-
-              {/* Video controls */}
-              <div className="video-controls">
-                <button 
-                  className={`control-btn ${!isMuted ? 'active' : 'inactive'}`}
-                  onClick={() => setIsMuted(!isMuted)}
-                  title={isMuted ? 'Unmute' : 'Mute'}
-                >
-                  {isMuted ? '🔇' : '🔊'}
-                </button>
-                <button 
-                  className={`control-btn ${!isVideoOff ? 'active' : 'inactive'}`}
-                  onClick={() => setIsVideoOff(!isVideoOff)}
-                  title={isVideoOff ? 'Start video' : 'Stop video'}
-                >
-                  {isVideoOff ? '📷' : '🎥'}
-                </button>
-              </div>
-
-              {/* Participant label */}
-              <div className="participant-label">
-                {username || user?.username || 'You'}
-                {isHost && <span className="host-badge">(Host)</span>}
-              </div>
-            </div>
-
-            {/* Participant strip */}
-            {participants.length > 1 && (
-              <div className="participants-strip">
-                {participants.slice(1).map((p) => (
-                  <div key={p.id} className="participant-tile">
-                    <span className="icon">👤</span>
-                    <span className="name">{p.name}</span>
-                  </div>
-                ))}
-              </div>
-            )}
+          <div className="gm-controls-right">
+            <button className={`gm-ctrl-btn-sm ${showInfo ? 'active' : ''}`} onClick={() => { setShowInfo(!showInfo); setShowChat(false); setShowParticipants(false) }} title="Meeting details">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><path d="M12 16v-4M12 8h.01" /></svg>
+            </button>
+            <button className={`gm-ctrl-btn-sm ${showParticipants ? 'active' : ''}`} onClick={() => { setShowParticipants(!showParticipants); setShowChat(false); setShowInfo(false) }} title="People">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" /></svg>
+              {participants.length > 0 && <span className="gm-badge-count">{participants.length}</span>}
+            </button>
+            <button className={`gm-ctrl-btn-sm ${showChat ? 'active' : ''}`} onClick={() => { setShowChat(!showChat); setShowParticipants(false); setShowInfo(false) }} title="Chat">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" /></svg>
+              {unreadCount > 0 && !showChat && <span className="gm-badge-count">{unreadCount}</span>}
+            </button>
           </div>
+        </div>
+      </div>
 
-          {/* Sidebar */}
-          <div className="call-sidebar">
-            {/* Pending participants */}
-            {isHost && pendingParticipants.length > 0 && (
-              <div className="sidebar-panel">
-                <div className="panel-header">
-                  <span className="icon">🔔</span>
-                  <span>Waiting to Join</span>
+      {/* Right side panel */}
+      {sidebarOpen && (
+        <div className="gm-panel">
+          {/* Meeting info panel */}
+          {showInfo && (
+            <>
+              <div className="gm-panel-header">
+                <h3>Meeting details</h3>
+                <button className="gm-panel-close" onClick={() => setShowInfo(false)}>✕</button>
+              </div>
+              <div className="gm-panel-body">
+                <div className="gm-info-section">
+                  <label>Joining info</label>
+                  <div className="gm-info-link">{window.location.origin}?code={meetingCode}</div>
+                  <button className="gm-btn gm-btn-outline" onClick={copyMeetingLink}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
+                    Copy joining info
+                  </button>
                 </div>
-                <div className="pending-list">
-                  {pendingParticipants.map((p) => (
-                    <div key={p.id} className="pending-item">
-                      <span className="name">{p.name}</span>
-                      <div className="pending-actions">
-                        <button className="admit-btn" onClick={() => admitParticipant(p.id)}>✓</button>
-                        <button className="reject-btn" onClick={() => rejectParticipant(p.id)}>✗</button>
+                <div className="gm-info-section">
+                  <label>Meeting code</label>
+                  <div className="gm-code-inline">{meetingCode}</div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Participants panel */}
+          {showParticipants && (
+            <>
+              <div className="gm-panel-header">
+                <h3>People ({participants.length})</h3>
+                <button className="gm-panel-close" onClick={() => setShowParticipants(false)}>✕</button>
+              </div>
+              <div className="gm-panel-body">
+                {/* Pending */}
+                {isHost && pendingParticipants.length > 0 && (
+                  <div className="gm-pending-section">
+                    <h4>Waiting to join ({pendingParticipants.length})</h4>
+                    {pendingParticipants.map((p) => (
+                      <div key={p.sid} className="gm-person-row gm-pending-row">
+                        <span className="gm-person-avatar">{p.username?.[0]?.toUpperCase()}</span>
+                        <span className="gm-person-name">{p.username}</span>
+                        <div className="gm-pending-btns">
+                          <button className="gm-btn gm-btn-sm gm-btn-admit" onClick={() => admitParticipant(p.sid)}>Admit</button>
+                          <button className="gm-btn gm-btn-sm gm-btn-deny" onClick={() => rejectParticipant(p.sid)}>Deny</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* In call */}
+                <div className="gm-people-list">
+                  {participants.map((p) => (
+                    <div key={p.sid} className="gm-person-row">
+                      <span className="gm-person-avatar">{p.username?.[0]?.toUpperCase()}</span>
+                      <span className="gm-person-name">{p.username} {p.is_host && <span className="gm-host-label">(Host)</span>}</span>
+                      <div className="gm-person-icons">
+                        {p.audio === false && <span title="Muted">🔇</span>}
+                        {p.video === false && <span title="Camera off">📷</span>}
                       </div>
                     </div>
                   ))}
                 </div>
               </div>
-            )}
+            </>
+          )}
 
-            {/* Participants */}
-            <div className="sidebar-panel">
-              <div className="panel-header">
-                <span className="icon">👥</span>
-                <span>Participants ({participants.length})</span>
+          {/* Chat panel */}
+          {showChat && (
+            <>
+              <div className="gm-panel-header">
+                <h3>In-call messages</h3>
+                <button className="gm-panel-close" onClick={() => setShowChat(false)}>✕</button>
               </div>
-              <div className="participants-list">
-                {participants.map((p) => (
-                  <div key={p.id} className="participant-row">
-                    <span className="name">{p.name}</span>
-                    {p.isHost && <span className="badge">Host</span>}
-                  </div>
-                ))}
+              <div className="gm-panel-body gm-chat-body">
+                <div className="gm-chat-messages">
+                  {chatMessages.length === 0 && <div className="gm-chat-empty"><p>Messages can only be seen by people in the call and are deleted when the call ends.</p></div>}
+                  {chatMessages.map((m) => (
+                    <div key={m.id || m.timestamp} className={`gm-chat-msg ${m.sid === mySocketId ? 'mine' : ''}`}>
+                      <span className="gm-chat-sender">{m.username}</span>
+                      <span className="gm-chat-text">{m.text}</span>
+                      <span className="gm-chat-time">{new Date(m.timestamp || Date.now()).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </div>
+                <div className="gm-chat-input-row">
+                  <input className="gm-chat-input" placeholder="Send a message to everyone" value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && sendChat()} />
+                  <button className="gm-chat-send" onClick={sendChat} disabled={!chatInput.trim()}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" /></svg>
+                  </button>
+                </div>
               </div>
-            </div>
-
-            {/* Transcript */}
-            <div className="sidebar-panel">
-              <div className="panel-header">
-                <span className="icon">📝</span>
-                <span>Live Transcript</span>
-              </div>
-              <div className="transcript-box">
-                {transcript ? (
-                  <span className="transcript-text">{transcript}</span>
-                ) : (
-                  <span className="transcript-placeholder">No signs detected yet...</span>
-                )}
-              </div>
-              <div className="transcript-actions">
-                <button className="transcript-btn" onClick={clearTranscript}>Clear</button>
-                <button className="transcript-btn" onClick={downloadTranscript}>Download</button>
-              </div>
-            </div>
-          </div>
+            </>
+          )}
         </div>
       )}
+    </div>
+  )
+}
+
+// =================================================================
+// Remote video tile
+// =================================================================
+
+function RemoteVideo({ remote }) {
+  const videoRef = useRef(null)
+  useEffect(() => { if (videoRef.current && remote.stream) videoRef.current.srcObject = remote.stream }, [remote.stream])
+
+  return (
+    <div className="gm-tile">
+      <video ref={videoRef} autoPlay playsInline className={`gm-tile-video ${remote.video === false ? 'hidden' : ''}`} />
+      {remote.video === false && <div className="gm-tile-avatar"><span className="gm-avatar">{remote.username?.[0]?.toUpperCase() || '?'}</span></div>}
+      <div className="gm-tile-bar">
+        <span className="gm-tile-name">{remote.username}</span>
+        {remote.audio === false && <span className="gm-tile-muted">🔇</span>}
+      </div>
     </div>
   )
 }

@@ -80,20 +80,40 @@ def predict_landmarks():
     try:
         data = request.json
         landmarks = data.get('landmarks', [])
-        if not landmarks or len(landmarks) < 63:
-            return jsonify({'sign': None, 'confidence': 0, 'caption': model.get_caption()})
+        
+        # BUG FIX: Stricter validation of landmark array
+        if not landmarks or not isinstance(landmarks, (list, tuple)):
+            return jsonify({'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
+        
+        # BUG FIX: Ensure exactly 63 dimensions
+        if len(landmarks) != 63:
+            return jsonify({'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
 
         features = np.array(landmarks[:63], dtype=np.float64)
+        
+        # BUG FIX: Validate all values are finite
+        if not np.all(np.isfinite(features)):
+            return jsonify({'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
+        
         letter, confidence = model.predict_from_landmarks(features)
         model.update_spelling(letter, confidence)
+
+        # Determine sign type: phrase (multi-char words), digit, or letter
+        if letter and letter in {'HELLO', 'STOP', 'I LOVE YOU', 'NO', 'YES', 'BYE'}:
+            sign_type = 'phrase'
+        elif letter and letter in {'0','1','2','3','4','5','6','7','8','9'}:
+            sign_type = 'digit'
+        else:
+            sign_type = 'letter'
 
         return jsonify({
             'sign': letter,
             'confidence': float(confidence),
             'caption': model.get_caption(),
+            'sign_type': sign_type,
         })
     except Exception as e:
-        return jsonify({'sign': None, 'confidence': 0, 'caption': '', 'error': str(e)})
+        return jsonify({'sign': None, 'confidence': 0, 'caption': '', 'error': str(e), 'sign_type': 'letter'}), 400
 
 
 @app.route('/train', methods=['POST'])
@@ -444,31 +464,57 @@ def on_chat(data):
 def on_predict_landmarks(data):
     """ASL prediction via Socket (lower latency than REST)."""
     landmarks = data.get('landmarks', [])
-    if not landmarks or len(landmarks) < 63:
-        emit('prediction', {'sign': None, 'confidence': 0, 'caption': model.get_caption()})
+    
+    # BUG FIX: Stricter validation of landmark array
+    if not landmarks or not isinstance(landmarks, (list, tuple)):
+        emit('prediction', {'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
         return
+    
+    # BUG FIX: Ensure exactly 63 dimensions (21 landmarks × 3 coordinates)
+    if len(landmarks) != 63:
+        emit('prediction', {'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
+        return
+    
+    try:
+        # BUG FIX: Validate all values are numeric and finite
+        features = np.array(landmarks[:63], dtype=np.float64)
+        if not np.all(np.isfinite(features)):
+            emit('prediction', {'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'sign_type': 'letter'})
+            return
+            
+        letter, confidence = model.predict_from_landmarks(features)
+        model.update_spelling(letter, confidence)
 
-    features = np.array(landmarks[:63], dtype=np.float64)
-    letter, confidence = model.predict_from_landmarks(features)
-    model.update_spelling(letter, confidence)
+        # Determine sign type: phrase, digit, or letter
+        if letter and letter in {'HELLO', 'STOP', 'I LOVE YOU', 'NO', 'YES', 'BYE'}:
+            sign_type = 'phrase'
+        elif letter and letter in {'0','1','2','3','4','5','6','7','8','9'}:
+            sign_type = 'digit'
+        else:
+            sign_type = 'letter'
 
-    result = {
-        'sign': letter,
-        'confidence': float(confidence),
-        'caption': model.get_caption(),
-    }
-    emit('prediction', result)
-
-    # Broadcast caption to the meeting room
-    code = user_sockets.get(request.sid, {}).get('meeting_code')
-    if code and code in meetings:
-        socketio.emit('peer-caption', {
-            'sid': request.sid,
-            'username': user_sockets.get(request.sid, {}).get('username'),
-            'caption': model.get_caption(),
+        result = {
             'sign': letter,
             'confidence': float(confidence),
-        }, room=code)
+            'caption': model.get_caption(),
+            'sign_type': sign_type,
+        }
+        emit('prediction', result)
+
+        # Broadcast caption to the meeting room
+        code = user_sockets.get(request.sid, {}).get('meeting_code')
+        if code and code in meetings:
+            socketio.emit('peer-caption', {
+                'sid': request.sid,
+                'username': user_sockets.get(request.sid, {}).get('username'),
+                'caption': model.get_caption(),
+                'sign': letter,
+                'confidence': float(confidence),
+                'sign_type': sign_type,
+            }, room=code)
+    except Exception as e:
+        print(f"[PREDICT] Error: {e}")
+        emit('prediction', {'sign': None, 'confidence': 0, 'caption': model.get_caption(), 'error': str(e), 'sign_type': 'letter'})
 
 
 @socketio.on('screen-share-started')
@@ -503,4 +549,4 @@ if __name__ == '__main__':
     status = 'Trained' if model.is_trained else 'Untrained (rule-based only)'
     print(f"  Model: {status}")
     print("=" * 55)
-    socketio.run(app, debug=False, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=False, host='0.0.0.0', port=5000,allow_unsafe_werkzeug=True)
